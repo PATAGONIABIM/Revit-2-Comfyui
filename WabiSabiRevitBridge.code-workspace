@@ -1,0 +1,11 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../ComfyUI_WabiSabi_Bridge"
+		}
+	],
+	"settings": {}
+}
