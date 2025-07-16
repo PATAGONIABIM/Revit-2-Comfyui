@@ -14,6 +14,9 @@ using Autodesk.Revit.UI;
 using WinForms = System.Windows.Forms;
 using Drawing = System.Drawing;
 
+// Extractores
+using WabiSabiBridge.Extractors;
+
 namespace WabiSabiBridge
 {
     /// <summary>
@@ -79,6 +82,9 @@ namespace WabiSabiBridge
     {
         public UIApplication UiApp { get; set; }
         public string OutputPath { get; set; }
+        public bool ExportDepth { get; set; }
+        public int DepthResolution { get; set; } = 512;
+        public int DepthQuality { get; set; } = 1; // 0=Rápida, 1=Normal, 2=Alta
         public Action<string, Drawing.Color> UpdateStatusCallback { get; set; }
         
         public void Execute(UIApplication app)
@@ -86,7 +92,8 @@ namespace WabiSabiBridge
             try
             {
                 UiApp = app;
-                Document doc = app.ActiveUIDocument.Document;
+                UIDocument uiDoc = app.ActiveUIDocument;
+                Document doc = uiDoc.Document;
                 View3D view3D = doc.ActiveView as View3D;
                 
                 if (view3D == null)
@@ -94,23 +101,78 @@ namespace WabiSabiBridge
                     UpdateStatusCallback?.Invoke("Error: No hay vista 3D activa", Drawing.Color.Red);
                     return;
                 }
+
+                UIView uiView = uiDoc.GetOpenUIViews().FirstOrDefault(v => v.ViewId == view3D.Id);
+                if (uiView == null)
+                {
+                    UpdateStatusCallback?.Invoke("Error: No se pudo obtener la ventana de la vista para el encuadre.", Drawing.Color.Red);
+                    return;
+                }
+
+                // <-- CAMBIO: Obtener las esquinas de la vista para garantizar un encuadre perfecto.
+                IList<XYZ> viewCorners = uiView.GetZoomCorners();
+
+                var viewRect = uiView.GetWindowRectangle();
+                double viewWidth = viewRect.Right - viewRect.Left;
+                double viewHeight = viewRect.Bottom - viewRect.Top;
+
+                if (viewWidth <= 0 || viewHeight <= 0)
+                {
+                    UpdateStatusCallback?.Invoke("Advertencia: Dimensiones de vista inválidas. Usando proporción por defecto 16:9.", Drawing.Color.Orange);
+                    viewWidth = 16;
+                    viewHeight = 9;
+                }
                 
-                // Crear directorio si no existe
+                double aspectRatio = viewWidth / viewHeight;
+
+                int depthWidth = this.DepthResolution;
+                int depthHeight = (int)Math.Round(depthWidth / aspectRatio);
+                
                 if (!Directory.Exists(OutputPath))
                 {
                     Directory.CreateDirectory(OutputPath);
                 }
                 
-                // Timestamp para archivos únicos
                 string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
                 
-                // 1. Exportar imagen de líneas ocultas
+                UpdateStatusCallback?.Invoke("Exportando vista...", Drawing.Color.Blue);
                 ExportHiddenLineImage(doc, view3D, OutputPath, timestamp);
                 
-                // 2. Exportar metadatos básicos
-                ExportMetadata(doc, view3D, OutputPath, timestamp);
+                if (ExportDepth)
+                {
+                    string depthStatus = DepthQuality == 0 ? "Generando mapa de profundidad (modo rápido)..." :
+                                       DepthQuality == 2 ? "Generando mapa de profundidad (alta calidad)..." :
+                                       "Generando mapa de profundidad...";
+                    UpdateStatusCallback?.Invoke(depthStatus, Drawing.Color.Blue);
+                    
+                    try
+                    {
+                        if (DepthQuality == 0) // Rápida
+                        {
+                            var depthExtractor = new DepthExtractorFast(app, DepthResolution, 4);
+                            // <-- CAMBIO: Pasar las esquinas de la vista al extractor
+                            depthExtractor.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
+                        }
+                        else if (DepthQuality == 2) // Alta
+                        {
+                            var depthExtractor = new DepthExtractor(app, DepthResolution);
+                            // <-- CAMBIO: Pasar las esquinas de la vista al extractor
+                            depthExtractor.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
+                        }
+                        else // Normal
+                        {
+                            var depthExtractor = new DepthExtractorFast(app, DepthResolution, 2);
+                            // <-- CAMBIO: Pasar las esquinas de la vista al extractor
+                            depthExtractor.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        UpdateStatusCallback?.Invoke($"Advertencia: Error en profundidad - {ex.Message}", Drawing.Color.Orange);
+                    }
+                }
                 
-                // 3. Crear archivo de notificación para ComfyUI
+                ExportMetadata(doc, view3D, OutputPath, timestamp);
                 CreateNotificationFile(OutputPath, timestamp);
                 
                 UpdateStatusCallback?.Invoke($"Exportado: {timestamp}", Drawing.Color.Green);
@@ -123,7 +185,6 @@ namespace WabiSabiBridge
         
         private void ExportHiddenLineImage(Document doc, View3D view3D, string outputPath, string timestamp)
         {
-            // Configurar opciones de exportación
             ImageExportOptions options = new ImageExportOptions
             {
                 FilePath = Path.Combine(outputPath, $"render_{timestamp}"),
@@ -134,7 +195,6 @@ namespace WabiSabiBridge
                 ExportRange = ExportRange.CurrentView
             };
             
-            // Exportar usando transacción
             using (Transaction trans = new Transaction(doc, "Export Image"))
             {
                 trans.Start();
@@ -142,7 +202,6 @@ namespace WabiSabiBridge
                 trans.Commit();
             }
             
-            // Renombrar archivo para consistencia
             string generatedFile = Path.Combine(outputPath, $"render_{timestamp}.png");
             string targetFile = Path.Combine(outputPath, "current_render.png");
             
@@ -164,7 +223,7 @@ namespace WabiSabiBridge
                 display_style = view3D.DisplayStyle.ToString(),
                 camera = new
                 {
-                    eye_position = new { x = 0, y = 0, z = 0 }, // TODO: Extraer posición real
+                    eye_position = new { x = 0, y = 0, z = 0 },
                     target_position = new { x = 0, y = 0, z = 0 },
                     up_vector = new { x = 0, y = 1, z = 0 }
                 },
@@ -181,7 +240,6 @@ namespace WabiSabiBridge
         
         private void CreateNotificationFile(string outputPath, string timestamp)
         {
-            // Archivo que ComfyUI puede vigilar para saber que hay nuevos datos
             string notificationPath = Path.Combine(outputPath, "last_update.txt");
             File.WriteAllText(notificationPath, timestamp);
         }
@@ -240,6 +298,9 @@ namespace WabiSabiBridge
         private WinForms.Button _browseButton;
         private WinForms.Label _statusLabel;
         private WinForms.CheckBox _autoExportCheckBox;
+        private WinForms.CheckBox _exportDepthCheckBox;
+        private WinForms.ComboBox _depthResolutionCombo;
+        private WinForms.ComboBox _depthQualityCombo;
         private WinForms.Timer _autoExportTimer;
         
         // Configuración
@@ -258,8 +319,8 @@ namespace WabiSabiBridge
         private void InitializeUI()
         {
             // Configuración de la ventana
-            Text = "WabiSabi Bridge - MVP";
-            Size = new Drawing.Size(400, 250);
+            Text = "WabiSabi Bridge - v0.2.1";
+            Size = new Drawing.Size(400, 340);
             StartPosition = WinForms.FormStartPosition.CenterScreen;
             FormBorderStyle = WinForms.FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -269,7 +330,7 @@ namespace WabiSabiBridge
             {
                 Dock = WinForms.DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 5,
+                RowCount = 7,
                 Padding = new WinForms.Padding(10)
             };
             
@@ -306,7 +367,81 @@ namespace WabiSabiBridge
             };
             _exportButton.Click += ExportButton_Click;
             
-            // Fila 3: Auto-exportación
+            // Fila 3: Opciones de exportación
+            WinForms.GroupBox exportOptionsGroup = new WinForms.GroupBox
+            {
+                Text = "Opciones de exportación",
+                Height = 105,
+                Dock = WinForms.DockStyle.Fill
+            };
+            
+            // Checkbox para mapa de profundidad
+            _exportDepthCheckBox = new WinForms.CheckBox
+            {
+                Text = "Generar mapa de profundidad",
+                Location = new Drawing.Point(10, 20),
+                Width = 200,
+                Checked = _config.ExportDepth
+            };
+            _exportDepthCheckBox.CheckedChanged += ExportDepthCheckBox_CheckedChanged;
+            
+            // ComboBox para resolución de profundidad
+            WinForms.Label depthResLabel = new WinForms.Label 
+            { 
+                Text = "Resolución:", 
+                Location = new Drawing.Point(30, 45),
+                Width = 70
+            };
+            
+            _depthResolutionCombo = new WinForms.ComboBox
+            {
+                Location = new Drawing.Point(100, 43),
+                Width = 100,
+                DropDownStyle = WinForms.ComboBoxStyle.DropDownList,
+                Enabled = _config.ExportDepth
+            };
+            _depthResolutionCombo.Items.AddRange(new object[] { "256", "512", "1024", "2048" });
+            _depthResolutionCombo.SelectedItem = _config.DepthResolution.ToString();
+            _depthResolutionCombo.SelectedIndexChanged += DepthResolutionCombo_SelectedIndexChanged;
+            
+            // ComboBox para calidad
+            WinForms.Label depthQualityLabel = new WinForms.Label 
+            { 
+                Text = "Calidad:", 
+                Location = new Drawing.Point(220, 45),
+                Width = 50
+            };
+            
+            _depthQualityCombo = new WinForms.ComboBox
+            {
+                Location = new Drawing.Point(270, 43),
+                Width = 80,
+                DropDownStyle = WinForms.ComboBoxStyle.DropDownList,
+                Enabled = _config.ExportDepth
+            };
+            _depthQualityCombo.Items.AddRange(new object[] { "Rápida", "Normal", "Alta" });
+            _depthQualityCombo.SelectedIndex = _config.DepthQuality;
+            _depthQualityCombo.SelectedIndexChanged += DepthQualityCombo_SelectedIndexChanged;
+            
+            // Label de tiempo estimado
+            WinForms.Label timeEstimateLabel = new WinForms.Label
+            {
+                Name = "timeEstimateLabel",
+                Text = GetTimeEstimate(),
+                Location = new Drawing.Point(30, 70),
+                Width = 320,
+                ForeColor = Drawing.Color.Gray,
+                Font = new Drawing.Font(Font.FontFamily, 8)
+            };
+            
+            exportOptionsGroup.Controls.Add(_exportDepthCheckBox);
+            exportOptionsGroup.Controls.Add(depthResLabel);
+            exportOptionsGroup.Controls.Add(_depthResolutionCombo);
+            exportOptionsGroup.Controls.Add(depthQualityLabel);
+            exportOptionsGroup.Controls.Add(_depthQualityCombo);
+            exportOptionsGroup.Controls.Add(timeEstimateLabel);
+            
+            // Fila 4: Auto-exportación
             _autoExportCheckBox = new WinForms.CheckBox
             {
                 Text = "Exportación automática (experimental)",
@@ -315,7 +450,7 @@ namespace WabiSabiBridge
             };
             _autoExportCheckBox.CheckedChanged += AutoExportCheckBox_CheckedChanged;
             
-            // Fila 4: Estado
+            // Fila 5: Estado
             _statusLabel = new WinForms.Label
             {
                 Text = "Listo para exportar",
@@ -328,8 +463,9 @@ namespace WabiSabiBridge
             // Agregar controles al layout
             mainLayout.Controls.Add(pathPanel, 0, 0);
             mainLayout.Controls.Add(_exportButton, 0, 1);
-            mainLayout.Controls.Add(_autoExportCheckBox, 0, 2);
-            mainLayout.Controls.Add(_statusLabel, 0, 3);
+            mainLayout.Controls.Add(exportOptionsGroup, 0, 2);
+            mainLayout.Controls.Add(_autoExportCheckBox, 0, 3);
+            mainLayout.Controls.Add(_statusLabel, 0, 4);
             
             Controls.Add(mainLayout);
             
@@ -394,6 +530,67 @@ namespace WabiSabiBridge
             return true;
         }
         
+        private void ExportDepthCheckBox_CheckedChanged(object sender, EventArgs e)
+        {
+            _config.ExportDepth = _exportDepthCheckBox.Checked;
+            _depthResolutionCombo.Enabled = _exportDepthCheckBox.Checked;
+            _depthQualityCombo.Enabled = _exportDepthCheckBox.Checked;
+            _config.Save();
+            UpdateTimeEstimate();
+        }
+        
+        private void DepthResolutionCombo_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            if (int.TryParse(_depthResolutionCombo.SelectedItem.ToString(), out int resolution))
+            {
+                _config.DepthResolution = resolution;
+                _config.Save();
+                UpdateTimeEstimate();
+            }
+        }
+        
+        private void DepthQualityCombo_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            _config.DepthQuality = _depthQualityCombo.SelectedIndex;
+            _config.Save();
+            UpdateTimeEstimate();
+        }
+        
+        private void UpdateTimeEstimate()
+        {
+            var timeLabel = Controls.Find("timeEstimateLabel", true).FirstOrDefault() as WinForms.Label;
+            if (timeLabel != null)
+            {
+                timeLabel.Text = GetTimeEstimate();
+            }
+        }
+        
+        private string GetTimeEstimate()
+        {
+            if (!_exportDepthCheckBox.Checked)
+                return "";
+                
+            int resolution = _config.DepthResolution;
+            int quality = _config.DepthQuality;
+            
+            // Estimaciones basadas en pruebas
+            int[,] timeMatrix = new int[,] {
+                // Rápida, Normal, Alta
+                { 1, 3, 5 },      // 256
+                { 3, 10, 20 },    // 512
+                { 10, 40, 80 },   // 1024
+                { 40, 160, 320 }  // 2048
+            };
+            
+            int resIndex = resolution == 256 ? 0 : resolution == 512 ? 1 : resolution == 1024 ? 2 : 3;
+            int seconds = timeMatrix[resIndex, quality];
+            
+            if (seconds < 60)
+                return $"Tiempo estimado: ~{seconds} segundos";
+            else
+                return $"Tiempo estimado: ~{seconds / 60} minutos";
+        }
+        
         private void ExportCurrentView()
         {
             try
@@ -403,6 +600,9 @@ namespace WabiSabiBridge
                 // Configurar el handler con la ruta actual
                 _eventHandler.OutputPath = _outputPathTextBox.Text;
                 _eventHandler.UiApp = _uiApp;
+                _eventHandler.ExportDepth = _exportDepthCheckBox.Checked;
+                _eventHandler.DepthResolution = _config.DepthResolution;
+                _eventHandler.DepthQuality = _config.DepthQuality;
                 
                 // Ejecutar la exportación a través del ExternalEvent
                 _externalEvent.Raise();
@@ -444,6 +644,9 @@ namespace WabiSabiBridge
         );
         
         public bool AutoExport { get; set; } = false;
+        public bool ExportDepth { get; set; } = false;
+        public int DepthResolution { get; set; } = 512;
+        public int DepthQuality { get; set; } = 1; // 0=Rápida, 1=Normal, 2=Alta
         
         private static string ConfigPath => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -482,4 +685,10 @@ namespace WabiSabiBridge
             catch { }
         }
     }
+}
+
+// Namespace para extractores
+namespace WabiSabiBridge.Extractors
+{
+    // Los extractores van aquí
 }

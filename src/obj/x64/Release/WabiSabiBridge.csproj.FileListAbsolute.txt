@@ -1,8 +1,0 @@
-C:\WabiSabiRevitBridge\src\bin\x64\Release\WabiSabiBridge.dll
-C:\WabiSabiRevitBridge\src\bin\x64\Release\WabiSabiBridge.pdb
-C:\WabiSabiRevitBridge\src\obj\x64\Release\WabiSabiBridge.csproj.AssemblyReference.cache
-C:\WabiSabiRevitBridge\src\obj\x64\Release\WabiSabiBridge.GeneratedMSBuildEditorConfig.editorconfig
-C:\WabiSabiRevitBridge\src\obj\x64\Release\WabiSabiBridge.csproj.CoreCompileInputs.cache
-C:\WabiSabiRevitBridge\src\obj\x64\Release\WabiSabiBridge.sourcelink.json
-C:\WabiSabiRevitBridge\src\obj\x64\Release\WabiSabiBridge.dll
-C:\WabiSabiRevitBridge\src\obj\x64\Release\WabiSabiBridge.pdb

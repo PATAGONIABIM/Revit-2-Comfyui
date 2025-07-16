@@ -9,6 +9,7 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <ResolveAssemblyWarnOrErrorOnTargetArchitectureMismatch>None</ResolveAssemblyWarnOrErrorOnTargetArchitectureMismatch>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     
     <!-- Ruta de instalación de Revit 2026 (ajustar según sea necesario) -->
     <RevitInstallPath>C:\Program Files\Autodesk\Revit 2026</RevitInstallPath>

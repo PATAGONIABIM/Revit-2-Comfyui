@@ -59,13 +59,64 @@ private void Button_Click(object sender, EventArgs e)
 
 ### 1. **Agregar nuevos tipos de exportación**
 
-En el método `ExportCurrentView()`, después de exportar líneas ocultas:
+#### Patrón para nuevos extractores:
+
+1. **Crear clase en `src/Extractors/`**:
+```csharp
+namespace WabiSabiBridge.Extractors
+{
+    public class MyNewExtractor
+    {
+        private readonly UIApplication _uiApp;
+        
+        public MyNewExtractor(UIApplication uiApp)
+        {
+            _uiApp = uiApp;
+        }
+        
+        public void Extract(View3D view3D, string outputPath, string timestamp)
+        {
+            // Implementación
+        }
+    }
+}
+```
+
+2. **Agregar en ExportEventHandler.Execute()**:
+```csharp
+if (ExportMyFeature)
+{
+    var extractor = new MyNewExtractor(app);
+    extractor.Extract(view3D, OutputPath, timestamp);
+}
+```
+
+3. **Agregar controles en la UI**:
+- CheckBox para habilitar/deshabilitar
+- ComboBox o TextBox para opciones
+- Actualizar WabiSabiConfig
+
+#### Ejemplo: Agregar extractor de segmentación
 
 ```csharp
-// Agregar aquí nuevos extractores:
-ExportDepthMap(doc, view3D, outputPath, timestamp);
-ExportSegmentation(doc, view3D, outputPath, timestamp);
-ExportNormalMap(doc, view3D, outputPath, timestamp);
+// SegmentationExtractor.cs
+public class SegmentationExtractor
+{
+    public void ExtractSegmentation(View3D view3D, string outputPath, string timestamp)
+    {
+        // 1. Obtener categorías únicas
+        var categories = GetUniqueCategories(doc, view3D);
+        
+        // 2. Asignar color a cada categoría
+        var colorMap = AssignColors(categories);
+        
+        // 3. Renderizar imagen segmentada
+        var segmentationMap = RenderSegmentation(view3D, colorMap);
+        
+        // 4. Guardar imagen y leyenda
+        SaveSegmentation(segmentationMap, colorMap, outputPath, timestamp);
+    }
+}
 ```
 
 ### 2. **Mejorar la detección de cambios**
