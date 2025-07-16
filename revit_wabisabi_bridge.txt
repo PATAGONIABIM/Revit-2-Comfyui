@@ -1,0 +1,271 @@
+# Plan de Desarrollo Optimizado: WabiSabi Bridge - Módulo de Revit 2026
+
+## Resumen del Proyecto: WabiSabi Bridge - Módulo de Revit (Versión Optimizada)
+
+El objetivo de este proyecto es desarrollar un plugin de alto rendimiento para Autodesk Revit que actúe como un puente de datos en tiempo real hacia ComfyUI. El plugin extraerá información geométrica, de materiales y metadatos adicionales directamente de una vista 3D activa, procesándolos de manera eficiente y transmitiéndolos a través de un sistema de comunicación optimizado.
+
+Esta versión mejorada implementará técnicas avanzadas de renderizado como submuestreo adaptativo, paralelización de procesos, y un sistema de caché inteligente para minimizar el impacto en el rendimiento de Revit. La comunicación se realizará mediante named pipes o memoria compartida para eliminar la latencia de las operaciones de disco, manteniendo la opción de exportación a archivos para compatibilidad.
+
+El plugin operará en tres modos: **Modo Manual** para actualizaciones precisas bajo demanda, **Modo Automático Optimizado** que detectará cambios significativos con throttling configurable, y un nuevo **Modo Batch** para procesar múltiples vistas secuencialmente.
+
+## Plan de Desarrollo: Plugin de Revit Optimizado
+
+### Tecnologías y Prerrequisitos:
+
+- **Lenguaje**: C# (.NET Framework 4.8)
+- **IDE**: Visual Studio 2022
+- **API de Revit**: 2026 o posterior
+- **Librerías adicionales**:
+  - `System.IO.Pipes` para named pipes
+  - `System.Threading.Tasks.Dataflow` para procesamiento paralelo
+  - `ImageSharp` o `SkiaSharp` para manipulación avanzada de imágenes
+  - `MessagePack` para serialización binaria eficiente
+
+---
+
+## Fase 0: Fundación y Arquitectura Base
+
+### Módulo 0.1: Configuración del Entorno y Arquitectura
+**Tarea 0.1.1**: Configurar el proyecto en Visual Studio con estructura modular:
+- `/Core` - Lógica central y modelos de datos
+- `/Extractors` - Módulos de extracción de datos
+- `/Communication` - Sistema de comunicación
+- `/UI` - Interfaz de usuario
+- `/Utils` - Utilidades y helpers
+
+**Tarea 0.1.2**: Implementar el patrón de arquitectura **MVVM** para separar lógica de presentación
+
+**Tarea 0.1.3**: Crear sistema de **inyección de dependencias** para facilitar testing y mantenimiento
+
+### Módulo 0.2: Sistema de Configuración Avanzado
+**Tarea 0.2.1**: Implementar clase `WabiSabiConfiguration` con:
+- Configuración de rutas de salida
+- Parámetros de rendimiento (resolución, calidad, throttling)
+- Perfiles de exportación predefinidos
+- Serialización/deserialización en JSON
+
+**Tarea 0.2.2**: Crear sistema de **perfiles de usuario** para diferentes casos de uso
+
+---
+
+## Fase 1: Sistema de Comunicación Optimizado
+
+### Módulo 1.1: Capa de Abstracción de Comunicación
+**Tarea 1.1.1**: Crear interfaz `ICommunicationChannel` con implementaciones:
+- `FileCommunicationChannel` (retrocompatibilidad)
+- `NamedPipeCommunicationChannel` (rendimiento)
+- `SharedMemoryCommunicationChannel` (ultra-bajo latencia)
+
+**Tarea 1.1.2**: Implementar **protocolo de handshake** para establecer conexión con ComfyUI
+
+**Tarea 1.1.3**: Sistema de **heartbeat** para detectar desconexiones
+
+### Módulo 1.2: Serialización y Compresión
+**Tarea 1.2.1**: Implementar serialización binaria eficiente con MessagePack
+
+**Tarea 1.2.2**: Sistema de compresión adaptativa:
+- LZ4 para datos en tiempo real
+- ZSTD para modo batch
+- Sin compresión para memoria compartida
+
+**Tarea 1.2.3**: **Doble buffer** para evitar lecturas de datos parciales
+
+---
+
+## Fase 2: Interfaz de Usuario Mejorada
+
+### Módulo 2.1: Panel de Control Principal (WPF con Material Design)
+**Tarea 2.1.1**: Diseñar ventana dockable con tabs:
+- **Tab Principal**: Controles de modo y estado
+- **Tab Configuración**: Parámetros de calidad y rendimiento
+- **Tab Avanzado**: Selección de datos a exportar
+- **Tab Debug**: Logs y métricas en tiempo real
+
+**Tarea 2.1.2**: Controles principales mejorados:
+```
+[▶ Actualizar] [⏸ Pausar] [■ Detener]
+○ Manual  ● Automático  ○ Batch
+
+Throttling: [====|----] 5 fps
+Resolución: [1920x1080 ▼]
+
+[✓] Líneas Ocultas    [✓] Profundidad
+[✓] Segmentación      [✓] Normales
+[✓] Materials         [✓] Metadatos
+```
+
+**Tarea 2.1.3**: **Preview en miniatura** en tiempo real de los mapas generados
+
+### Módulo 2.2: Sistema de Notificaciones y Feedback
+**Tarea 2.2.1**: Implementar **toast notifications** no intrusivas
+
+**Tarea 2.2.2**: **Barra de progreso** para operaciones largas
+
+**Tarea 2.2.3**: **Indicadores visuales** de rendimiento (FPS, latencia, uso de memoria)
+
+---
+
+## Fase 3: Extractores de Datos Optimizados
+
+### Módulo 3.1: Motor de Renderizado Paralelo
+**Tarea 3.1.1**: Implementar clase base `ParallelExtractor` con:
+- División de viewport en tiles
+- Procesamiento paralelo con `Parallel.For`
+- Sistema de priorización de tiles (centro primero)
+
+**Tarea 3.1.2**: **Submuestreo adaptativo**:
+```csharp
+public class AdaptiveSampler {
+    - Fase 1: Renderizar a 25% de resolución
+    - Fase 2: Detectar bordes y áreas de alto detalle
+    - Fase 3: Refinar solo áreas necesarias
+}
+```
+
+### Módulo 3.2: Extractor de Líneas Ocultas Optimizado
+**Tarea 3.2.1**: Implementar caché de vistas pre-configuradas
+
+**Tarea 3.2.2**: Usar `ExportImage` con parámetros optimizados:
+- Antialiasing selectivo
+- Compresión PNG óptima
+- Recorte automático de márgenes vacíos
+
+### Módulo 3.3: Extractor de Profundidad Mejorado
+**Tarea 3.3.1**: Implementar **Z-buffer nativo** cuando esté disponible
+
+**Tarea 3.3.2**: ReferenceIntersector optimizado:
+```csharp
+public class OptimizedDepthExtractor {
+    - Usar ReferenceIntersector con FindReferencesWithContextByDirection
+    - Implementar early-exit para rayos que no impactan
+    - Cache de resultados para píxeles similares
+    - Precisión de 16-bit en formato EXR
+}
+```
+
+**Tarea 3.3.3**: **Normalización inteligente** con percentiles para evitar outliers
+
+### Módulo 3.4: Extractor de Segmentación Avanzado
+**Tarea 3.4.1**: Sistema de **paleta dinámica** basada en elementos visibles
+
+**Tarea 3.4.2**: Exportar **mapa de IDs de elementos** adicional
+
+**Tarea 3.4.3**: Opción de segmentación por:
+- Categoría
+- Material
+- Fase de construcción
+- Parámetros personalizados
+
+### Módulo 3.5: Extractor de Normales
+**Tarea 3.5.1**: Calcular normal maps desde geometría
+
+**Tarea 3.5.2**: Opciones de espacio (world/view/tangent)
+
+### Módulo 3.6: Extractor de Metadatos Enriquecidos
+**Tarea 3.6.1**: Extraer información estructurada:
+```json
+{
+  "materials": ["concrete", "glass", "steel"],
+  "room_types": ["office", "corridor"],
+  "lighting": {
+    "sun_direction": [0.7, 0.3, 0.6],
+    "time_of_day": "14:30"
+  },
+  "camera": {
+    "fov": 60,
+    "position": [10, 5, 3],
+    "target": [0, 0, 0]
+  }
+}
+```
+
+---
+
+## Fase 4: Sistema de Caché Inteligente
+
+### Módulo 4.1: Gestor de Caché Multinivel
+**Tarea 4.1.1**: Implementar `CacheManager` con:
+- Caché L1: Memoria (últimos frames)
+- Caché L2: Disco (sesión actual)
+- Caché L3: Base de datos (histórico)
+
+**Tarea 4.1.2**: **Hashing perceptual** para detectar cambios significativos
+
+**Tarea 4.1.3**: Sistema de **invalidación selectiva** basado en elementos modificados
+
+### Módulo 4.2: Optimización de Memoria
+**Tarea 4.2.1**: Pool de objetos para bitmaps y arrays
+
+**Tarea 4.2.2**: Garbage collection manual en momentos oportunos
+
+**Tarea 4.2.3**: Compresión en memoria para datos inactivos
+
+---
+
+## Fase 5: Modos de Operación Avanzados
+
+### Módulo 5.1: Modo Automático Inteligente
+**Tarea 5.1.1**: Detector de cambios mejorado:
+```csharp
+public class ChangeDetector {
+    - Monitorear Transform de vista
+    - Detectar cambios en elementos visibles
+    - Tracking de modificaciones de materiales
+    - Umbral configurable de sensibilidad
+}
+```
+
+**Tarea 5.1.2**: **Throttling dinámico** basado en:
+- Complejidad de la escena
+- Rendimiento del sistema
+- Actividad del usuario
+
+### Módulo 5.2: Modo Batch
+**Tarea 5.2.1**: Sistema de cola para procesar múltiples vistas
+
+**Tarea 5.2.2**: Procesamiento en background thread
+
+**Tarea 5.2.3**: Exportación a carpetas organizadas por vista/fecha
+
+---
+
+## Fase 6: Testing y Optimización Final
+
+### Módulo 6.1: Suite de Pruebas
+**Tarea 6.1.1**: Unit tests para cada extractor
+
+**Tarea 6.1.2**: Integration tests con modelos de ejemplo
+
+**Tarea 6.1.3**: Performance benchmarks con escenas complejas
+
+### Módulo 6.2: Profiling y Optimización
+**Tarea 6.2.1**: Análisis con dotTrace o PerfView
+
+**Tarea 6.2.2**: Optimización de hot paths identificados
+
+**Tarea 6.2.3**: Reducción de allocaciones en loops críticos
+
+### Módulo 6.3: Documentación y Distribución
+**Tarea 6.3.1**: Documentación técnica completa con diagramas
+
+**Tarea 6.3.2**: Video tutoriales de instalación y uso
+
+**Tarea 6.3.3**: Sistema de actualización automática
+
+**Tarea 6.3.4**: Telemetría opcional para mejorar el producto
+
+---
+
+## Consideraciones de Rendimiento
+
+1. **Target de rendimiento**: 30+ FPS en modelos medianos (< 1M polígonos)
+2. **Uso de memoria**: < 500MB adicionales
+3. **Latencia**: < 50ms desde cambio hasta notificación
+4. **Escalabilidad**: Soportar modelos de hasta 10M polígonos con degradación gradual
+
+## Roadmap Futuro
+
+- **v2.0**: Soporte para Revit LT y otras versiones
+- **v2.1**: Integración con Enscape/Lumion para datos adicionales
+- **v2.2**: API pública para extensiones de terceros
+- **v3.0**: Comunicación bidireccional completa con ComfyUI

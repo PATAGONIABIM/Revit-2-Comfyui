@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<RevitAddIns>
+  <AddIn Type="Application">
+    <Name>WabiSabi Bridge</Name>
+    <Assembly>WabiSabiBridge.dll</Assembly>
+    <AddInId>7B6F1234-5678-9ABC-DEF0-123456789ABC</AddInId>
+    <FullClassName>WabiSabiBridge.WabiSabiBridgeApp</FullClassName>
+    <VendorId>WabiSabi</VendorId>
+    <VendorDescription>WabiSabi Bridge for ComfyUI Integration</VendorDescription>
+    <Description>Real-time bridge between Revit and ComfyUI for AI-powered architectural visualization</Description>
+    <VisibilityMode>AlwaysVisible</VisibilityMode>
+  </AddIn>
+</RevitAddIns>
