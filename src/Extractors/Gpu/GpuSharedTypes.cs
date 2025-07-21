@@ -1,13 +1,14 @@
 // GpuSharedTypes.cs - Tipos compartidos para aceleración GPU
 using System;
+using System.IO.MemoryMappedFiles;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
-using ComputeSharp; // <<-- AÑADIDO para usar sus tipos nativos
+using ComputeSharp;
 
 namespace WabiSabiBridge.Extractors.Gpu
 {
     /// <summary>
-    /// Interfaz común para gestores de aceleración GPU
+    /// Interfaz común para gestores de aceleración GPU con soporte de caché
     /// </summary>
     public interface IGpuAccelerationManager : IDisposable
     {
@@ -15,6 +16,13 @@ namespace WabiSabiBridge.Extractors.Gpu
         void CreateGeometrySharedMemory(string name, long sizeInBytes);
         void WriteGeometryData(float[] vertices, int[] indices, float[] normals);
         Task<float[]> ExecuteDepthRayTracingAsync(ExtractedGeometry geometry, RayTracingConfig config);
+        
+        // NUEVO: Método optimizado que usa el caché directamente
+        Task<float[]> ExecuteDepthRayTracingFromCacheAsync(
+            MemoryMappedFile cacheFile, 
+            int vertexCount, 
+            int triangleCount, 
+            RayTracingConfig config);
     }
     
     /// <summary>
@@ -37,15 +45,13 @@ namespace WabiSabiBridge.Extractors.Gpu
     [StructLayout(LayoutKind.Sequential)]
     public struct RayTracingConfig
     {
-        public Float3 EyePosition;      // <<-- CORREGIDO
-        public Float3 ViewDirection;    // <<-- CORREGIDO
-        public Float3 UpDirection;      // <<-- CORREGIDO
-        public Float3 RightDirection;   // <<-- CORREGIDO
+        public Float3 EyePosition;
+        public Float3 ViewDirection;
+        public Float3 UpDirection;
+        public Float3 RightDirection;
         public int Width;
         public int Height;
         public float MinDepth;
         public float MaxDepth;
     }
-    
-    // <<-- ELIMINADAS las estructuras float3 e int3 personalizadas para evitar ambigüedad -->>
 }

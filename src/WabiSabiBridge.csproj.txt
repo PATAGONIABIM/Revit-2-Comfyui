@@ -13,6 +13,7 @@
     <Nullable>enable</Nullable>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
     
     <!-- Suprime las advertencias de compatibilidad con Windows (CA1416) -->
     <SupportedOSPlatformVersion>7.0</SupportedOSPlatformVersion>

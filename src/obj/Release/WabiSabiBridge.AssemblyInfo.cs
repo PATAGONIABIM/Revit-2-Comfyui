@@ -13,7 +13,7 @@ using System.Reflection;
 [assembly: System.Reflection.AssemblyCompanyAttribute("WabiSabiBridge")]
 [assembly: System.Reflection.AssemblyConfigurationAttribute("Release")]
 [assembly: System.Reflection.AssemblyFileVersionAttribute("1.0.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+089c605f145b829b067ac94b2c96e3762d800285")]
+[assembly: System.Reflection.AssemblyInformationalVersionAttribute("1.0.0+085bb447f24d57df350b5e8b4c00e56e843495c1")]
 [assembly: System.Reflection.AssemblyProductAttribute("WabiSabiBridge")]
 [assembly: System.Reflection.AssemblyTitleAttribute("WabiSabiBridge")]
 [assembly: System.Reflection.AssemblyVersionAttribute("1.0.0.0")]
