@@ -115,33 +115,6 @@ namespace WabiSabiBridge
                     return;
                 }
 
-                UIView? uiView = uiDoc.GetOpenUIViews().FirstOrDefault(v => v.ViewId == view3D.Id);
-                if (uiView == null)
-                {
-                    UpdateStatusCallback?.Invoke("Error: No se pudo obtener la ventana de la vista para el encuadre.", Drawing.Color.Red);
-                    return;
-                }
-
-                IList<XYZ> viewCorners = uiView.GetZoomCorners();
-
-                var viewRect = uiView.GetWindowRectangle();
-                double viewWidth = viewRect.Right - viewRect.Left;
-                double viewHeight = viewRect.Bottom - viewRect.Top;
-
-                if (viewWidth <= 0 || viewHeight <= 0)
-                {
-                    UpdateStatusCallback?.Invoke("Advertencia: Dimensiones de vista inválidas. Usando proporción por defecto 16:9.", Drawing.Color.Orange);
-                    viewWidth = 16;
-                    viewHeight = 9;
-                }
-
-                double aspectRatio = viewWidth / viewHeight;
-
-                int depthWidth = this.DepthResolution;
-
-                double rawDepthHeight = depthWidth / aspectRatio;
-                int depthHeight = (int)(Math.Round(rawDepthHeight / 2.0) * 2.0);
-
                 if (!Directory.Exists(OutputPath))
                 {
                     Directory.CreateDirectory(OutputPath);
@@ -149,56 +122,80 @@ namespace WabiSabiBridge
 
                 string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmss");
 
-                UpdateStatusCallback?.Invoke("Exportando vista...", Drawing.Color.Blue);
-                ExportHiddenLineImage(doc, view3D, OutputPath, timestamp);
+                // --- INICIO DE LA LÓGICA CORREGIDA ---
+
+                // 1. Obtener la vista UI para calcular el aspect ratio real, que es la fuente de verdad.
+                UIView? uiView = uiDoc.GetOpenUIViews().FirstOrDefault(v => v.ViewId == view3D.Id);
+                if (uiView == null)
+                {
+                    UpdateStatusCallback?.Invoke("Error: No se pudo obtener la ventana de la vista para el encuadre.", Drawing.Color.Red);
+                    return;
+                }
+                var viewRect = uiView.GetWindowRectangle();
+                double trueAspectRatio = (double)(viewRect.Right - viewRect.Left) / (viewRect.Bottom - viewRect.Top);
+
+                // 2. Calcular las dimensiones del mapa de profundidad basadas en este aspect ratio.
+                int depthWidth = this.DepthResolution; // El ancho lo define el usuario.
+                double rawDepthHeight = depthWidth / trueAspectRatio; // Calculamos el alto para que coincida.
+                int depthHeight = (int)(Math.Round(rawDepthHeight / 2.0) * 2.0); // Asegurar que la altura sea par.
+
+                // 3. Exportar la imagen de renderizado, forzándola a tener las MISMAS dimensiones que el mapa de profundidad.
+                UpdateStatusCallback?.Invoke("Exportando y sincronizando vista...", Drawing.Color.Blue);
+                ExportHiddenLineImage(doc, view3D, OutputPath, timestamp, depthWidth, depthHeight);
+
+                // 4. Obtener los viewCorners para los extractores de profundidad.
+                IList<XYZ> viewCorners = uiView.GetZoomCorners();
+
+                // --- FIN DE LA LÓGICA CORREGIDA ---
 
                 if (ExportDepth)
                 {
                     _gpuManager ??= new GpuAccelerationManager(null);
                     // NUEVO: Usar flujo optimizado con caché para modo experimental
+                    // Bloque a reemplazar dentro de ExportEventHandler.Execute(...)
+
                     if (UseGeometryExtraction && UseGpuAcceleration && _gpuManager?.IsGpuAvailable == true)
                     {
                         UpdateStatusCallback?.Invoke("Modo experimental con caché inteligente...", Drawing.Color.Blue);
 
                         try
                         {
-                            // Usar el GeometryCacheManager
                             var cacheManager = WabiSabiBridge.Extractors.Cache.GeometryCacheManager.Instance;
                             var cachedData = cacheManager.EnsureCacheIsValid(doc, view3D, UpdateStatusCallback);
 
-                            // Obtener datos de la cámara (siempre rápido)
-                            var viewOrientation = view3D.GetOrientation();
-                            var eyePosition = viewOrientation.EyePosition;
-                            var forwardDirection = viewOrientation.ForwardDirection.Normalize();
-                            var upDirection = viewOrientation.UpDirection.Normalize();
-                            var rightDirection = forwardDirection.CrossProduct(upDirection).Normalize();
+                            var eyePosition = view3D.GetOrientation().EyePosition;
+                            // --- LÍNEA AÑADIDA PARA CORREGIR EL ERROR DE COMPILACIÓN ---
+                            var forwardDirection = view3D.GetOrientation().ForwardDirection.Normalize();
+                            // --- FIN DE LA LÍNEA AÑADIDA ---
 
-                            // Calcular rango de profundidad
+                            var corners = uiView.GetZoomCorners();
+                            var cornerBottomLeft = corners[0];
+                            var cornerTopRight = corners[1];
+
+                            // Reconstruir las 4 esquinas del viewport para máxima precisión
+                            var up = view3D.GetOrientation().UpDirection.Normalize();
+                            var right = forwardDirection.CrossProduct(up).Normalize();
+                            var viewDiagonal = cornerTopRight - cornerBottomLeft;
+                            var rightComponent = viewDiagonal.DotProduct(right) * right;
+                            var upComponent = viewDiagonal.DotProduct(up) * up;
+                            var cornerBottomRight = cornerBottomLeft + rightComponent;
+                            var cornerTopLeft = cornerBottomLeft + upComponent;
+
+                            var baseVector = cornerBottomLeft - eyePosition;
+                            var rightSpanVector = cornerBottomRight - cornerBottomLeft;
+                            var upSpanVector = cornerTopLeft - cornerBottomLeft;
+                            
+                            // Ahora esta línea compilará correctamente porque 'forwardDirection' existe
                             double minDepth = 0.1;
-                            double maxDepth = CalculateMaxDepth(view3D, eyePosition, forwardDirection,
-                                new XYZ((viewCorners[0].X + viewCorners[1].X) / 2.0,
-                                       (viewCorners[0].Y + viewCorners[1].Y) / 2.0,
-                                       (viewCorners[0].Z + viewCorners[1].Z) / 2.0));
+                            double maxDepth = CalculateMaxDepth(view3D, eyePosition, forwardDirection, (cornerBottomLeft + cornerTopRight) / 2.0);
 
-                            // Configuración para GPU
+                            // Configuración para GPU usando los vectores de interpolación
                             var config = new WabiSabiBridge.Extractors.Gpu.RayTracingConfig
                             {
-                                EyePosition = new ComputeSharp.Float3(
-                                    (float)eyePosition.X,
-                                    (float)eyePosition.Y,
-                                    (float)eyePosition.Z),
-                                ViewDirection = new ComputeSharp.Float3(
-                                    (float)forwardDirection.X,
-                                    (float)forwardDirection.Y,
-                                    (float)forwardDirection.Z),
-                                UpDirection = new ComputeSharp.Float3(
-                                    (float)upDirection.X,
-                                    (float)upDirection.Y,
-                                    (float)upDirection.Z),
-                                RightDirection = new ComputeSharp.Float3(
-                                    (float)rightDirection.X,
-                                    (float)rightDirection.Y,
-                                    (float)rightDirection.Z),
+                                EyePosition = new ComputeSharp.Float3((float)eyePosition.X, (float)eyePosition.Y, (float)eyePosition.Z),
+                                ViewDirection = new ComputeSharp.Float3((float)baseVector.X, (float)baseVector.Y, (float)baseVector.Z),
+                                RightDirection = new ComputeSharp.Float3((float)rightSpanVector.X, (float)rightSpanVector.Y, (float)rightSpanVector.Z),
+                                UpDirection = new ComputeSharp.Float3((float)upSpanVector.X, (float)upSpanVector.Y, (float)upSpanVector.Z),
                                 Width = depthWidth,
                                 Height = depthHeight,
                                 MinDepth = (float)minDepth,
@@ -207,7 +204,7 @@ namespace WabiSabiBridge
 
                             UpdateStatusCallback?.Invoke("Procesando en GPU con caché...", Drawing.Color.Blue);
 
-                            // Ejecutar en GPU usando el caché
+                            // El resto del código no cambia...
                             var depthTask = Task.Run(async () =>
                             {
                                 return await _gpuManager.ExecuteDepthRayTracingFromCacheAsync(
@@ -218,8 +215,6 @@ namespace WabiSabiBridge
                             });
 
                             float[] gpuDepthBuffer = depthTask.Result;
-
-                            // Convertir a double[,] y generar imagen
                             double[,] depthData = new double[depthHeight, depthWidth];
                             for (int y = 0; y < depthHeight; y++)
                             {
@@ -231,7 +226,6 @@ namespace WabiSabiBridge
 
                             GenerateDepthImage(depthData, depthWidth, depthHeight, OutputPath, timestamp);
 
-                            // Mostrar estadísticas del caché
                             UpdateStatusCallback?.Invoke(
                                 $"Completado con caché - {cacheManager.GetPerformanceStats()}",
                                 Drawing.Color.Green);
@@ -239,7 +233,6 @@ namespace WabiSabiBridge
                         catch (Exception ex)
                         {
                             UpdateStatusCallback?.Invoke($"Error en modo experimental: {ex.Message}", Drawing.Color.Red);
-                            // Fallback al modo normal
                             UseGeometryExtraction = false;
                             Execute(app);
                             return;
@@ -308,16 +301,26 @@ namespace WabiSabiBridge
             }
         }
         
-        private void ExportHiddenLineImage(Document doc, View3D view3D, string outputPath, string timestamp)
+        // MÉTODO REEMPLAZADO CON TU ACTUALIZACIÓN
+        private void ExportHiddenLineImage(Document doc, View3D view3D, string outputPath, string timestamp, 
+    int targetWidth, int targetHeight)
         {
             ImageExportOptions options = new ImageExportOptions
             {
                 FilePath = Path.Combine(outputPath, $"render_{timestamp}"),
-                FitDirection = FitDirectionType.Horizontal,
                 HLRandWFViewsFileType = ImageFileType.PNG,
                 ImageResolution = ImageResolution.DPI_150,
-                PixelSize = 1920,
-                ExportRange = ExportRange.CurrentView
+
+                // --- INICIO DE LA CORRECCIÓN CRÍTICA ---
+                // Forzar a Revit a usar el zoom y encuadre actual de la vista, sin hacer ajustes automáticos.
+                // Esto garantiza que la perspectiva de la imagen renderizada coincida con la del mapa de profundidad.
+                ZoomType = ZoomFitType.Zoom,
+                ExportRange = ExportRange.VisibleRegionOfCurrentView,
+                // --- FIN DE LA CORRECCIÓN CRÍTICA ---
+
+                // Establecemos el tamaño de píxel deseado. Revit se aproximará lo mejor posible.
+                PixelSize = targetWidth,
+                FitDirection = FitDirectionType.Horizontal 
             };
             
             using (Transaction trans = new Transaction(doc, "Export Image"))
@@ -326,41 +329,66 @@ namespace WabiSabiBridge
                 doc.ExportImage(options);
                 trans.Commit();
             }
-            
+
+            // El resto de la lógica para redimensionar y nombrar el archivo sigue siendo válida y necesaria
+            // para garantizar una coincidencia de píxeles perfecta.
             string generatedFile = Path.Combine(outputPath, $"render_{timestamp}.png");
             string targetFile = Path.Combine(outputPath, "current_render.png");
-            
+
             if (File.Exists(generatedFile))
             {
-                byte[] fileBytes = File.ReadAllBytes(generatedFile);
-                using (var ms = new MemoryStream(fileBytes))
-                using (var originalImage = Drawing.Image.FromStream(ms))
+                using (var originalImage = Drawing.Image.FromFile(generatedFile))
                 {
-                    int newHeight = originalImage.Height;
-
-                    if (newHeight % 2 != 0)
+                    // Si las dimensiones finales no coinciden, se redimensiona con letterboxing.
+                    if (originalImage.Width != targetWidth || originalImage.Height != targetHeight)
                     {
-                        newHeight--;
-                    }
-
-                    if (newHeight == originalImage.Height)
-                    {
-                        File.Copy(generatedFile, targetFile, true);
+                        using (var resizedImage = new Drawing.Bitmap(targetWidth, targetHeight))
+                        {
+                            resizedImage.SetResolution(originalImage.HorizontalResolution, originalImage.VerticalResolution);
+                            using (var g = Drawing.Graphics.FromImage(resizedImage))
+                            {
+                                g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+                                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+                                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                                g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                                
+                                float srcAspect = (float)originalImage.Width / originalImage.Height;
+                                float dstAspect = (float)targetWidth / targetHeight;
+                                
+                                int drawWidth, drawHeight, drawX, drawY;
+                                
+                                if (srcAspect > dstAspect)
+                                {
+                                    drawHeight = targetHeight;
+                                    drawWidth = (int)(targetHeight * srcAspect);
+                                    drawX = (targetWidth - drawWidth) / 2;
+                                    drawY = 0;
+                                }
+                                else
+                                {
+                                    drawWidth = targetWidth;
+                                    drawHeight = (int)(targetWidth / srcAspect);
+                                    drawX = 0;
+                                    drawY = (targetHeight - drawHeight) / 2;
+                                }
+                                
+                                // Usar un color de fondo oscuro similar al de tu render.
+                                g.Clear(Drawing.Color.FromArgb(255, 40, 43, 48));
+                                g.DrawImage(originalImage, new Drawing.Rectangle(drawX, drawY, drawWidth, drawHeight));
+                            }
+                            
+                            resizedImage.Save(targetFile, Drawing.Imaging.ImageFormat.Png);
+                        }
                     }
                     else
                     {
-                        var cropRect = new Drawing.Rectangle(0, 0, originalImage.Width, newHeight);
-                        using (var newBitmap = new Drawing.Bitmap(cropRect.Width, cropRect.Height))
-                        {
-                            newBitmap.SetResolution(originalImage.HorizontalResolution, originalImage.VerticalResolution);
-                            using (var g = Drawing.Graphics.FromImage(newBitmap))
-                            {
-                                g.DrawImage(originalImage, new Drawing.Rectangle(0, 0, newBitmap.Width, newBitmap.Height), cropRect, Drawing.GraphicsUnit.Pixel);
-                            }
-                            newBitmap.Save(targetFile, Drawing.Imaging.ImageFormat.Png);
-                        }
+                        // Las dimensiones ya coinciden, solo se guarda con el nombre correcto.
+                        originalImage.Save(targetFile, Drawing.Imaging.ImageFormat.Png);
                     }
                 }
+                
+                // Limpiar el archivo temporal.
+                try { File.Delete(generatedFile); } catch (IOException) { /* Ignorar si está bloqueado */ }
             }
         }
         
@@ -509,7 +537,7 @@ namespace WabiSabiBridge
             _depthExtractorFast?.Dispose();
         }
     }
-    
+        
     /// <summary>
     /// Aplicación principal del plugin con soporte para invalidación de caché
     /// </summary>

@@ -45,14 +45,21 @@ namespace WabiSabiBridge.Extractors.Gpu
 
             int pixelIndex = id.Y * config.Width + id.X;
             
+            // --- INICIO DE LA CORRECCIÓN DEL SHADER (MÉTODO ROBUSTO) ---
+
+            // Coordenadas de interpolación en el rango [0, 1]
             float u = (float)id.X / (config.Width - 1);
+            // Invertimos Y para que coincida con el sistema de coordenadas de la imagen
             float v = 1.0f - ((float)id.Y / (config.Height - 1));
             
-            Float3 rayDirection = Hlsl.Normalize(
-                config.ViewDirection + 
-                (u - 0.5f) * 2.0f * config.RightDirection + 
-                (v - 0.5f) * 2.0f * config.UpDirection
-            );
+            // Calculamos la dirección del rayo interpolando desde la esquina inferior izquierda.
+            // ViewDirection   = Vector desde el Ojo a la Esquina Inferior Izquierda.
+            // RightDirection  = Vector del ancho total de la vista.
+            // UpDirection     = Vector de la altura total de la vista.
+            Float3 directionToPixel = config.ViewDirection + (u * config.RightDirection) + (v * config.UpDirection);
+            Float3 rayDirection = Hlsl.Normalize(directionToPixel);
+
+            // --- FIN DE LA CORRECCIÓN ---
             
             float closestDistance = float.MaxValue;
             
