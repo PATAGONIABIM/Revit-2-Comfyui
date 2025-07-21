@@ -1,10 +1,14 @@
 {
   "version": 2,
-  "dgSpecHash": "gJaHim80raE=",
+  "dgSpecHash": "MRkl2Bx9Ni0=",
   "success": true,
   "projectFilePath": "C:\\WabiSabiRevitBridge\\src\\WabiSabiBridge.csproj",
   "expectedPackageFiles": [
-    "C:\\Users\\chris\\.nuget\\packages\\newtonsoft.json\\13.0.3\\newtonsoft.json.13.0.3.nupkg.sha512"
+    "C:\\Users\\chris\\.nuget\\packages\\computesharp\\2.1.0\\computesharp.2.1.0.nupkg.sha512",
+    "C:\\Users\\chris\\.nuget\\packages\\computesharp.core\\2.1.0\\computesharp.core.2.1.0.nupkg.sha512",
+    "C:\\Users\\chris\\.nuget\\packages\\computesharp.d2d1\\2.1.0\\computesharp.d2d1.2.1.0.nupkg.sha512",
+    "C:\\Users\\chris\\.nuget\\packages\\newtonsoft.json\\13.0.3\\newtonsoft.json.13.0.3.nupkg.sha512",
+    "C:\\Users\\chris\\.nuget\\packages\\terrafx.interop.windows\\10.0.22621.2\\terrafx.interop.windows.10.0.22621.2.nupkg.sha512"
   ],
   "logs": []
 }

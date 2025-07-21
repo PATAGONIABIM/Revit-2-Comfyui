@@ -1,4 +1,4 @@
-// WabiSabiBridge.cs - Implementación MVP para Revit 2026
+﻿// WabiSabiBridge.cs - Implementación con aceleración GPU v0.3.0
 using System;
 using System.IO;
 using System.Collections.Generic;
@@ -16,6 +16,7 @@ using Drawing = System.Drawing;
 
 // Extractores
 using WabiSabiBridge.Extractors;
+using WabiSabiBridge.Extractors.Gpu; // <<-- AÑADIDO para resolver ambigüedades
 
 namespace WabiSabiBridge
 {
@@ -26,9 +27,9 @@ namespace WabiSabiBridge
     [Regeneration(RegenerationOption.Manual)]
     public class WabiSabiBridgeCommand : IExternalCommand
     {
-        private static WabiSabiBridgeWindow _window;
-        private static ExternalEvent _externalEvent;
-        private static ExportEventHandler _eventHandler;
+        private static WabiSabiBridgeWindow? _window;
+        private static ExternalEvent? _externalEvent;
+        private static ExportEventHandler? _eventHandler;
         
         public Result Execute(ExternalCommandData commandData, ref string message, ElementSet elements)
         {
@@ -38,25 +39,23 @@ namespace WabiSabiBridge
                 UIDocument uiDoc = uiApp.ActiveUIDocument;
                 Document doc = uiDoc.Document;
                 
-                // Verificar que hay una vista 3D activa
-                View3D view3D = doc.ActiveView as View3D;
+                View3D? view3D = doc.ActiveView as View3D;
                 if (view3D == null)
                 {
-                    TaskDialog.Show("WabiSabi Bridge", "Por favor, activa una vista 3D antes de ejecutar el comando.");
+                    Autodesk.Revit.UI.TaskDialog.Show("WabiSabi Bridge", "Por favor, activa una vista 3D antes de ejecutar el comando.");
                     return Result.Failed;
                 }
                 
-                // Crear el handler y evento si no existen
                 if (_eventHandler == null)
                 {
                     _eventHandler = new ExportEventHandler();
                     _externalEvent = ExternalEvent.Create(_eventHandler);
                 }
                 
-                // Crear o mostrar la ventana principal
                 if (_window == null || _window.IsDisposed)
                 {
-                    _window = new WabiSabiBridgeWindow(uiApp, _externalEvent, _eventHandler);
+                    // CORREGIDO: Usar el operador "null-forgiving" (!) porque sabemos que no son nulos aquí.
+                    _window = new WabiSabiBridgeWindow(uiApp, _externalEvent!, _eventHandler!);
                     _window.Show();
                 }
                 else
@@ -80,12 +79,19 @@ namespace WabiSabiBridge
     /// </summary>
     public class ExportEventHandler : IExternalEventHandler
     {
-        public UIApplication UiApp { get; set; }
-        public string OutputPath { get; set; }
+        public UIApplication? UiApp { get; set; }
+        public string OutputPath { get; set; } = string.Empty;
         public bool ExportDepth { get; set; }
         public int DepthResolution { get; set; } = 512;
         public int DepthQuality { get; set; } = 1; // 0=Rápida, 1=Normal, 2=Alta
-        public Action<string, Drawing.Color> UpdateStatusCallback { get; set; }
+        public bool AutoDepthRange { get; set; } = true;
+        public double DepthRangeDistance { get; set; } = 50.0;
+        public bool UseGpuAcceleration { get; set; } = true;
+        public bool UseGeometryExtraction { get; set; } = false;
+        public Action<string, Drawing.Color>? UpdateStatusCallback { get; set; }
+        
+        private DepthExtractor? _depthExtractor;
+        private DepthExtractorFast? _depthExtractorFast;
         
         public void Execute(UIApplication app)
         {
@@ -94,7 +100,7 @@ namespace WabiSabiBridge
                 UiApp = app;
                 UIDocument uiDoc = app.ActiveUIDocument;
                 Document doc = uiDoc.Document;
-                View3D view3D = doc.ActiveView as View3D;
+                View3D? view3D = doc.ActiveView as View3D;
                 
                 if (view3D == null)
                 {
@@ -102,14 +108,13 @@ namespace WabiSabiBridge
                     return;
                 }
 
-                UIView uiView = uiDoc.GetOpenUIViews().FirstOrDefault(v => v.ViewId == view3D.Id);
+                UIView? uiView = uiDoc.GetOpenUIViews().FirstOrDefault(v => v.ViewId == view3D.Id);
                 if (uiView == null)
                 {
                     UpdateStatusCallback?.Invoke("Error: No se pudo obtener la ventana de la vista para el encuadre.", Drawing.Color.Red);
                     return;
                 }
 
-                // <-- CAMBIO: Obtener las esquinas de la vista para garantizar un encuadre perfecto.
                 IList<XYZ> viewCorners = uiView.GetZoomCorners();
 
                 var viewRect = uiView.GetWindowRectangle();
@@ -126,7 +131,9 @@ namespace WabiSabiBridge
                 double aspectRatio = viewWidth / viewHeight;
 
                 int depthWidth = this.DepthResolution;
-                int depthHeight = (int)Math.Round(depthWidth / aspectRatio);
+                
+                double rawDepthHeight = depthWidth / aspectRatio;
+                int depthHeight = (int)(Math.Round(rawDepthHeight / 2.0) * 2.0);
                 
                 if (!Directory.Exists(OutputPath))
                 {
@@ -140,42 +147,58 @@ namespace WabiSabiBridge
                 
                 if (ExportDepth)
                 {
-                    string depthStatus = DepthQuality == 0 ? "Generando mapa de profundidad (modo rápido)..." :
-                                       DepthQuality == 2 ? "Generando mapa de profundidad (alta calidad)..." :
-                                       "Generando mapa de profundidad...";
+                    string gpuStatus = UseGpuAcceleration ? " (GPU)" : "";
+                    string depthStatus = DepthQuality == 0 ? $"Generando mapa de profundidad (modo rápido{gpuStatus})..." :
+                                       DepthQuality == 2 ? $"Generando mapa de profundidad (alta calidad{gpuStatus})..." :
+                                       $"Generando mapa de profundidad{gpuStatus}...";
                     UpdateStatusCallback?.Invoke(depthStatus, Drawing.Color.Blue);
                     
                     try
                     {
                         if (DepthQuality == 0) // Rápida
                         {
-                            var depthExtractor = new DepthExtractorFast(app, DepthResolution, 4);
-                            // <-- CAMBIO: Pasar las esquinas de la vista al extractor
-                            depthExtractor.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
+                            _depthExtractorFast ??= new DepthExtractorFast(app, DepthResolution, 4);
+                            _depthExtractorFast.AutoDepthRange = this.AutoDepthRange;
+                            _depthExtractorFast.ManualDepthDistance = this.DepthRangeDistance;
+                            _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
+                            _depthExtractorFast.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
                         }
                         else if (DepthQuality == 2) // Alta
                         {
-                            var depthExtractor = new DepthExtractor(app, DepthResolution);
-                            // <-- CAMBIO: Pasar las esquinas de la vista al extractor
-                            depthExtractor.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
+                            _depthExtractor ??= new DepthExtractor(app, DepthResolution);
+                            _depthExtractor.AutoDepthRange = this.AutoDepthRange;
+                            _depthExtractor.ManualDepthDistance = this.DepthRangeDistance;
+                            _depthExtractor.UseGpuAcceleration = this.UseGpuAcceleration;
+                            _depthExtractor.UseGeometryExtraction = this.UseGeometryExtraction;
+                            _depthExtractor.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
                         }
                         else // Normal
                         {
-                            var depthExtractor = new DepthExtractorFast(app, DepthResolution, 2);
-                            // <-- CAMBIO: Pasar las esquinas de la vista al extractor
-                            depthExtractor.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
+                            _depthExtractorFast ??= new DepthExtractorFast(app, DepthResolution, 2);
+                            _depthExtractorFast.AutoDepthRange = this.AutoDepthRange;
+                            _depthExtractorFast.ManualDepthDistance = this.DepthRangeDistance;
+                            _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
+                            _depthExtractorFast.ExtractDepthMap(view3D, OutputPath, timestamp, depthWidth, depthHeight, viewCorners);
                         }
                     }
                     catch (Exception ex)
                     {
                         UpdateStatusCallback?.Invoke($"Advertencia: Error en profundidad - {ex.Message}", Drawing.Color.Orange);
+                        if (UseGpuAcceleration)
+                        {
+                            UpdateStatusCallback?.Invoke("Reintentando sin GPU...", Drawing.Color.Orange);
+                            UseGpuAcceleration = false;
+                            Execute(app); // Reintentar
+                            return;
+                        }
                     }
                 }
                 
                 ExportMetadata(doc, view3D, OutputPath, timestamp);
                 CreateNotificationFile(OutputPath, timestamp);
                 
-                UpdateStatusCallback?.Invoke($"Exportado: {timestamp}", Drawing.Color.Green);
+                string gpuInfo = UseGpuAcceleration ? " [GPU]" : "";
+                UpdateStatusCallback?.Invoke($"Exportado: {timestamp}{gpuInfo}", Drawing.Color.Green);
             }
             catch (Exception ex)
             {
@@ -207,7 +230,35 @@ namespace WabiSabiBridge
             
             if (File.Exists(generatedFile))
             {
-                File.Copy(generatedFile, targetFile, true);
+                byte[] fileBytes = File.ReadAllBytes(generatedFile);
+                using (var ms = new MemoryStream(fileBytes))
+                using (var originalImage = Drawing.Image.FromStream(ms))
+                {
+                    int newHeight = originalImage.Height;
+
+                    if (newHeight % 2 != 0)
+                    {
+                        newHeight--;
+                    }
+
+                    if (newHeight == originalImage.Height)
+                    {
+                        File.Copy(generatedFile, targetFile, true);
+                    }
+                    else
+                    {
+                        var cropRect = new Drawing.Rectangle(0, 0, originalImage.Width, newHeight);
+                        using (var newBitmap = new Drawing.Bitmap(cropRect.Width, cropRect.Height))
+                        {
+                            newBitmap.SetResolution(originalImage.HorizontalResolution, originalImage.VerticalResolution);
+                            using (var g = Drawing.Graphics.FromImage(newBitmap))
+                            {
+                                g.DrawImage(originalImage, new Drawing.Rectangle(0, 0, newBitmap.Width, newBitmap.Height), cropRect, Drawing.GraphicsUnit.Pixel);
+                            }
+                            newBitmap.Save(targetFile, Drawing.Imaging.ImageFormat.Png);
+                        }
+                    }
+                }
             }
         }
         
@@ -231,7 +282,8 @@ namespace WabiSabiBridge
                 {
                     name = doc.Title,
                     path = doc.PathName
-                }
+                },
+                gpu_acceleration = UseGpuAcceleration
             };
             
             string metadataPath = Path.Combine(outputPath, "current_metadata.json");
@@ -247,6 +299,12 @@ namespace WabiSabiBridge
         public string GetName()
         {
             return "WabiSabi Bridge Export Event";
+        }
+        
+        public void Dispose()
+        {
+            _depthExtractor?.Dispose();
+            _depthExtractorFast?.Dispose();
         }
     }
     
@@ -274,7 +332,7 @@ namespace WabiSabiBridge
             buttonData.ToolTip = "Exportar vista actual a ComfyUI";
             buttonData.LongDescription = "Extrae imágenes y datos de la vista 3D activa para usar en ComfyUI";
             
-            PushButton button = panel.AddItem(buttonData) as PushButton;
+            PushButton? button = panel.AddItem(buttonData) as PushButton;
             
             return Result.Succeeded;
         }
@@ -286,25 +344,35 @@ namespace WabiSabiBridge
     }
     
     /// <summary>
-    /// Ventana principal del plugin (MVP)
+    /// Ventana principal del plugin (v0.3.0 con GPU)
     /// </summary>
     public class WabiSabiBridgeWindow : WinForms.Form
     {
-        private UIApplication _uiApp;
-        private ExternalEvent _externalEvent;
-        private ExportEventHandler _eventHandler;
-        private WinForms.Button _exportButton;
-        private WinForms.TextBox _outputPathTextBox;
-        private WinForms.Button _browseButton;
-        private WinForms.Label _statusLabel;
-        private WinForms.CheckBox _autoExportCheckBox;
-        private WinForms.CheckBox _exportDepthCheckBox;
-        private WinForms.ComboBox _depthResolutionCombo;
-        private WinForms.ComboBox _depthQualityCombo;
-        private WinForms.Timer _autoExportTimer;
+        private readonly UIApplication _uiApp;
+        private readonly ExternalEvent _externalEvent;
+        private readonly ExportEventHandler _eventHandler;
+        
+        // CORREGIDO: Se elimina 'readonly' y se inicializa con 'null!' para suprimir la advertencia CS8618.
+        // El compilador no puede saber que InitializeComponent() los inicializa.
+        private WinForms.Button _exportButton = null!;
+        private WinForms.TextBox _outputPathTextBox = null!;
+        private WinForms.Button _browseButton = null!;
+        private WinForms.Label _statusLabel = null!;
+        private WinForms.CheckBox _autoExportCheckBox = null!;
+        private WinForms.CheckBox _exportDepthCheckBox = null!;
+        private WinForms.ComboBox _depthResolutionCombo = null!;
+        private WinForms.ComboBox _depthQualityCombo = null!;
+        private WinForms.Timer _autoExportTimer = null!;
+        private WinForms.TrackBar _depthRangeTrackBar = null!;
+        private WinForms.Label _depthRangeLabel = null!;
+        private WinForms.Label _depthRangeValueLabel = null!;
+        private WinForms.CheckBox _autoDepthCheckBox = null!;
+        private WinForms.CheckBox _gpuAccelerationCheckBox = null!;
+        private WinForms.CheckBox _geometryExtractionCheckBox = null!;
+        private WinForms.Label _gpuStatusLabel = null!;
         
         // Configuración
-        private WabiSabiConfig _config;
+        private readonly WabiSabiConfig _config;
         
         public WabiSabiBridgeWindow(UIApplication uiApp, ExternalEvent externalEvent, ExportEventHandler eventHandler)
         {
@@ -313,14 +381,15 @@ namespace WabiSabiBridge
             _eventHandler = eventHandler;
             _eventHandler.UpdateStatusCallback = UpdateStatus;
             _config = WabiSabiConfig.Load();
-            InitializeUI();
+            InitializeComponent(); // Este método inicializa los campos de arriba
+            CheckGpuStatus();
         }
         
-        private void InitializeUI()
+        private void InitializeComponent()
         {
             // Configuración de la ventana
-            Text = "WabiSabi Bridge - v0.2.1";
-            Size = new Drawing.Size(400, 340);
+            Text = "WabiSabi Bridge - v0.3.0 (GPU Enhanced)";
+            Size = new Drawing.Size(420, 550);
             StartPosition = WinForms.FormStartPosition.CenterScreen;
             FormBorderStyle = WinForms.FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -330,7 +399,7 @@ namespace WabiSabiBridge
             {
                 Dock = WinForms.DockStyle.Fill,
                 ColumnCount = 1,
-                RowCount = 7,
+                RowCount = 10,
                 Padding = new WinForms.Padding(10)
             };
             
@@ -371,7 +440,7 @@ namespace WabiSabiBridge
             WinForms.GroupBox exportOptionsGroup = new WinForms.GroupBox
             {
                 Text = "Opciones de exportación",
-                Height = 105,
+                Height = 125,
                 Dock = WinForms.DockStyle.Fill
             };
             
@@ -434,14 +503,84 @@ namespace WabiSabiBridge
                 Font = new Drawing.Font(Font.FontFamily, 8)
             };
             
+            // Checkbox para GPU
+            _gpuAccelerationCheckBox = new WinForms.CheckBox
+            {
+                Text = "Aceleración GPU",
+                Location = new Drawing.Point(30, 95),
+                Width = 130,
+                Checked = _config.UseGpuAcceleration,
+                Enabled = _config.ExportDepth
+            };
+            _gpuAccelerationCheckBox.CheckedChanged += GpuAccelerationCheckBox_CheckedChanged;
+            
+            // Checkbox para extracción de geometría (experimental)
+            _geometryExtractionCheckBox = new WinForms.CheckBox
+            {
+                Text = "Modo Experimental",
+                Location = new Drawing.Point(170, 95),
+                Width = 140,
+                Checked = _config.UseGeometryExtraction,
+                Enabled = _config.ExportDepth && _config.UseGpuAcceleration,
+                ForeColor = Drawing.Color.DarkOrange
+            };
+            _geometryExtractionCheckBox.CheckedChanged += GeometryExtractionCheckBox_CheckedChanged;
+            
             exportOptionsGroup.Controls.Add(_exportDepthCheckBox);
             exportOptionsGroup.Controls.Add(depthResLabel);
             exportOptionsGroup.Controls.Add(_depthResolutionCombo);
             exportOptionsGroup.Controls.Add(depthQualityLabel);
             exportOptionsGroup.Controls.Add(_depthQualityCombo);
             exportOptionsGroup.Controls.Add(timeEstimateLabel);
-            
-            // Fila 4: Auto-exportación
+            exportOptionsGroup.Controls.Add(_gpuAccelerationCheckBox);
+            exportOptionsGroup.Controls.Add(_geometryExtractionCheckBox);
+
+            // Fila 4: Control de rango de profundidad
+            WinForms.Panel depthRangePanel = new WinForms.Panel { Height = 60, Dock = WinForms.DockStyle.Fill };
+
+            _depthRangeLabel = new WinForms.Label
+            {
+                Text = "Distancia focal:",
+                Location = new Drawing.Point(10, 5),
+                Width = 100
+            };
+
+            _autoDepthCheckBox = new WinForms.CheckBox
+            {
+                Text = "Auto",
+                Location = new Drawing.Point(280, 5),
+                Width = 50,
+                Checked = _config.AutoDepthRange
+            };
+            _autoDepthCheckBox.CheckedChanged += AutoDepthCheckBox_CheckedChanged;
+
+            _depthRangeTrackBar = new WinForms.TrackBar
+            {
+                Location = new Drawing.Point(10, 25),
+                Width = 260,
+                Height = 30,
+                Minimum = 10,
+                Maximum = 500,
+                Value = (int)_config.DepthRangeDistance,
+                TickFrequency = 50,
+                Enabled = !_config.AutoDepthRange
+            };
+            _depthRangeTrackBar.ValueChanged += DepthRangeTrackBar_ValueChanged;
+
+            _depthRangeValueLabel = new WinForms.Label
+            {
+                Text = _config.AutoDepthRange ? "Auto" : $"{_config.DepthRangeDistance} ft",
+                Location = new Drawing.Point(280, 30),
+                Width = 80,
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+
+            depthRangePanel.Controls.Add(_depthRangeLabel);
+            depthRangePanel.Controls.Add(_autoDepthCheckBox);
+            depthRangePanel.Controls.Add(_depthRangeTrackBar);
+            depthRangePanel.Controls.Add(_depthRangeValueLabel);
+
+            // Fila 5: Auto-exportación
             _autoExportCheckBox = new WinForms.CheckBox
             {
                 Text = "Exportación automática (experimental)",
@@ -450,7 +589,17 @@ namespace WabiSabiBridge
             };
             _autoExportCheckBox.CheckedChanged += AutoExportCheckBox_CheckedChanged;
             
-            // Fila 5: Estado
+            // Fila 6: Estado GPU
+            _gpuStatusLabel = new WinForms.Label
+            {
+                Text = "Verificando GPU...",
+                Dock = WinForms.DockStyle.Fill,
+                TextAlign = Drawing.ContentAlignment.MiddleCenter,
+                ForeColor = Drawing.Color.Gray,
+                Font = new Drawing.Font(Font.FontFamily, 8, Drawing.FontStyle.Italic)
+            };
+            
+            // Fila 7: Estado
             _statusLabel = new WinForms.Label
             {
                 Text = "Listo para exportar",
@@ -464,9 +613,11 @@ namespace WabiSabiBridge
             mainLayout.Controls.Add(pathPanel, 0, 0);
             mainLayout.Controls.Add(_exportButton, 0, 1);
             mainLayout.Controls.Add(exportOptionsGroup, 0, 2);
-            mainLayout.Controls.Add(_autoExportCheckBox, 0, 3);
-            mainLayout.Controls.Add(_statusLabel, 0, 4);
-            
+            mainLayout.Controls.Add(depthRangePanel, 0, 3);
+            mainLayout.Controls.Add(_autoExportCheckBox, 0, 4);
+            mainLayout.Controls.Add(_gpuStatusLabel, 0, 5);
+            mainLayout.Controls.Add(_statusLabel, 0, 6);
+
             Controls.Add(mainLayout);
             
             // Timer para auto-exportación
@@ -480,7 +631,36 @@ namespace WabiSabiBridge
             }
         }
         
-        private void BrowseButton_Click(object sender, EventArgs e)
+        private void CheckGpuStatus()
+        {
+            try
+            {
+                // Pasa el `this` (la ventana) al manager para que pueda mostrar un diálogo
+                IGpuAccelerationManager? gpuManager = new GpuAccelerationManager(this);
+                
+                if (gpuManager.IsGpuAvailable)
+                {
+                    _gpuStatusLabel.Text = "GPU: Disponible ✓";
+                    _gpuStatusLabel.ForeColor = System.Drawing.Color.Green;
+                }
+                else
+                {
+                    // El mensaje de por qué no está disponible ya se habría mostrado
+                    _gpuStatusLabel.Text = "GPU: No disponible (usando CPU paralela)";
+                    _gpuStatusLabel.ForeColor = System.Drawing.Color.Orange;
+                }
+                gpuManager.Dispose();
+            }
+            catch (Exception ex) // Captura cualquier otra excepción inesperada
+            {
+                _gpuStatusLabel.Text = "GPU: Error al verificar";
+                _gpuStatusLabel.ForeColor = System.Drawing.Color.Red;
+                // Muestra el error detallado
+                Autodesk.Revit.UI.TaskDialog.Show("Error de GPU", $"Error detallado al verificar el estado de la GPU:\n\n{ex.ToString()}");
+            }
+        }
+        
+        private void BrowseButton_Click(object? sender, EventArgs e)
         {
             using (WinForms.FolderBrowserDialog dialog = new WinForms.FolderBrowserDialog())
             {
@@ -494,12 +674,12 @@ namespace WabiSabiBridge
             }
         }
         
-        private void ExportButton_Click(object sender, EventArgs e)
+        private void ExportButton_Click(object? sender, EventArgs e)
         {
             ExportCurrentView();
         }
         
-        private void AutoExportCheckBox_CheckedChanged(object sender, EventArgs e)
+        private void AutoExportCheckBox_CheckedChanged(object? sender, EventArgs e)
         {
             _config.AutoExport = _autoExportCheckBox.Checked;
             _config.Save();
@@ -514,7 +694,7 @@ namespace WabiSabiBridge
             }
         }
         
-        private void AutoExportTimer_Tick(object sender, EventArgs e)
+        private void AutoExportTimer_Tick(object? sender, EventArgs e)
         {
             // Verificar si la vista ha cambiado antes de exportar
             if (HasViewChanged())
@@ -530,18 +710,20 @@ namespace WabiSabiBridge
             return true;
         }
         
-        private void ExportDepthCheckBox_CheckedChanged(object sender, EventArgs e)
+        private void ExportDepthCheckBox_CheckedChanged(object? sender, EventArgs e)
         {
             _config.ExportDepth = _exportDepthCheckBox.Checked;
             _depthResolutionCombo.Enabled = _exportDepthCheckBox.Checked;
             _depthQualityCombo.Enabled = _exportDepthCheckBox.Checked;
+            _gpuAccelerationCheckBox.Enabled = _exportDepthCheckBox.Checked;
+            _geometryExtractionCheckBox.Enabled = _exportDepthCheckBox.Checked && _gpuAccelerationCheckBox.Checked;
             _config.Save();
             UpdateTimeEstimate();
         }
         
-        private void DepthResolutionCombo_SelectedIndexChanged(object sender, EventArgs e)
+        private void DepthResolutionCombo_SelectedIndexChanged(object? sender, EventArgs e)
         {
-            if (int.TryParse(_depthResolutionCombo.SelectedItem.ToString(), out int resolution))
+            if (int.TryParse(_depthResolutionCombo.SelectedItem?.ToString(), out int resolution))
             {
                 _config.DepthResolution = resolution;
                 _config.Save();
@@ -549,13 +731,47 @@ namespace WabiSabiBridge
             }
         }
         
-        private void DepthQualityCombo_SelectedIndexChanged(object sender, EventArgs e)
+        private void DepthQualityCombo_SelectedIndexChanged(object? sender, EventArgs e)
         {
             _config.DepthQuality = _depthQualityCombo.SelectedIndex;
             _config.Save();
             UpdateTimeEstimate();
         }
+
+        private void AutoDepthCheckBox_CheckedChanged(object? sender, EventArgs e)
+        {
+            _depthRangeTrackBar.Enabled = !_autoDepthCheckBox.Checked;
+            _depthRangeValueLabel.Text = _autoDepthCheckBox.Checked ? "Auto" : $"{_depthRangeTrackBar.Value} ft";
+            _config.AutoDepthRange = _autoDepthCheckBox.Checked;
+            _config.Save();
+        }
+
+        private void DepthRangeTrackBar_ValueChanged(object? sender, EventArgs e)
+        {
+            _depthRangeValueLabel.Text = $"{_depthRangeTrackBar.Value} ft";
+            _config.DepthRangeDistance = _depthRangeTrackBar.Value;
+            _config.Save();
+        }
         
+        private void GpuAccelerationCheckBox_CheckedChanged(object? sender, EventArgs e)
+        {
+            _config.UseGpuAcceleration = _gpuAccelerationCheckBox.Checked;
+            _geometryExtractionCheckBox.Enabled = _exportDepthCheckBox.Checked && _gpuAccelerationCheckBox.Checked;
+            if (!_gpuAccelerationCheckBox.Checked)
+            {
+                _geometryExtractionCheckBox.Checked = false;
+            }
+            _config.Save();
+            UpdateTimeEstimate();
+        }
+        
+        private void GeometryExtractionCheckBox_CheckedChanged(object? sender, EventArgs e)
+        {
+            _config.UseGeometryExtraction = _geometryExtractionCheckBox.Checked;
+            _config.Save();
+            UpdateTimeEstimate();
+        }
+
         private void UpdateTimeEstimate()
         {
             var timeLabel = Controls.Find("timeEstimateLabel", true).FirstOrDefault() as WinForms.Label;
@@ -572,9 +788,11 @@ namespace WabiSabiBridge
                 
             int resolution = _config.DepthResolution;
             int quality = _config.DepthQuality;
+            bool useGpu = _config.UseGpuAcceleration;
+            bool useGeometry = _config.UseGeometryExtraction;
             
             // Estimaciones basadas en pruebas
-            int[,] timeMatrix = new int[,] {
+            int[,] timeMatrixCpu = new int[,] {
                 // Rápida, Normal, Alta
                 { 1, 3, 5 },      // 256
                 { 3, 10, 20 },    // 512
@@ -582,13 +800,28 @@ namespace WabiSabiBridge
                 { 40, 160, 320 }  // 2048
             };
             
+            int[,] timeMatrixGpu = new int[,] {
+                // Rápida, Normal, Alta
+                { 1, 1, 2 },      // 256
+                { 1, 3, 5 },      // 512
+                { 2, 8, 15 },     // 1024
+                { 8, 30, 60 }     // 2048
+            };
+            
             int resIndex = resolution == 256 ? 0 : resolution == 512 ? 1 : resolution == 1024 ? 2 : 3;
-            int seconds = timeMatrix[resIndex, quality];
+            int seconds = useGpu ? timeMatrixGpu[resIndex, quality] : timeMatrixCpu[resIndex, quality];
+            
+            if (useGeometry)
+            {
+                seconds = (int)(seconds * 1.5); // Modo experimental es más lento
+            }
+            
+            string gpuText = useGpu ? " (GPU)" : " (CPU)";
             
             if (seconds < 60)
-                return $"Tiempo estimado: ~{seconds} segundos";
+                return $"Tiempo estimado: ~{seconds} segundos{gpuText}";
             else
-                return $"Tiempo estimado: ~{seconds / 60} minutos";
+                return $"Tiempo estimado: ~{seconds / 60} minutos{gpuText}";
         }
         
         private void ExportCurrentView()
@@ -603,7 +836,11 @@ namespace WabiSabiBridge
                 _eventHandler.ExportDepth = _exportDepthCheckBox.Checked;
                 _eventHandler.DepthResolution = _config.DepthResolution;
                 _eventHandler.DepthQuality = _config.DepthQuality;
-                
+                _eventHandler.AutoDepthRange = _autoDepthCheckBox.Checked;
+                _eventHandler.DepthRangeDistance = _depthRangeTrackBar.Value;
+                _eventHandler.UseGpuAcceleration = _gpuAccelerationCheckBox.Checked;
+                _eventHandler.UseGeometryExtraction = _geometryExtractionCheckBox.Checked;
+
                 // Ejecutar la exportación a través del ExternalEvent
                 _externalEvent.Raise();
             }
@@ -627,8 +864,9 @@ namespace WabiSabiBridge
         
         protected override void OnFormClosing(WinForms.FormClosingEventArgs e)
         {
-            _autoExportTimer?.Stop();
-            _autoExportTimer?.Dispose();
+            _autoExportTimer.Stop();
+            _autoExportTimer.Dispose();
+            _eventHandler.Dispose();
             base.OnFormClosing(e);
         }
     }
@@ -647,7 +885,11 @@ namespace WabiSabiBridge
         public bool ExportDepth { get; set; } = false;
         public int DepthResolution { get; set; } = 512;
         public int DepthQuality { get; set; } = 1; // 0=Rápida, 1=Normal, 2=Alta
-        
+        public bool AutoDepthRange { get; set; } = true;
+        public double DepthRangeDistance { get; set; } = 50.0;
+        public bool UseGpuAcceleration { get; set; } = true;
+        public bool UseGeometryExtraction { get; set; } = false;
+
         private static string ConfigPath => Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "WabiSabiBridge",
@@ -661,10 +903,13 @@ namespace WabiSabiBridge
                 if (File.Exists(ConfigPath))
                 {
                     string json = File.ReadAllText(ConfigPath);
-                    return JsonConvert.DeserializeObject<WabiSabiConfig>(json);
+                    return JsonConvert.DeserializeObject<WabiSabiConfig>(json) ?? new WabiSabiConfig();
                 }
             }
-            catch { }
+            catch
+            {
+                // Ignorar errores al cargar la configuración y devolver una nueva
+            }
             
             return new WabiSabiConfig();
         }
@@ -673,8 +918,8 @@ namespace WabiSabiBridge
         {
             try
             {
-                string dir = Path.GetDirectoryName(ConfigPath);
-                if (!Directory.Exists(dir))
+                string? dir = Path.GetDirectoryName(ConfigPath);
+                if (dir != null && !Directory.Exists(dir))
                 {
                     Directory.CreateDirectory(dir);
                 }
@@ -682,13 +927,18 @@ namespace WabiSabiBridge
                 string json = JsonConvert.SerializeObject(this, Formatting.Indented);
                 File.WriteAllText(ConfigPath, json);
             }
-            catch { }
+            catch 
+            {
+                // Ignorar errores al guardar la configuración
+            }
         }
     }
 }
 
-// Namespace para extractores
-namespace WabiSabiBridge.Extractors
-{
-    // Los extractores van aquí
-}
+// <<-- INICIO DE LA CORRECCIÓN -->>
+// Se eliminó el espacio de nombres 'WabiSabiBridge.Extractors' duplicado y sus clases.
+// El código original contenía aquí definiciones "dummy" que causaban los errores de
+// compilación CS0104 y CS0111. Al eliminarlas, el compilador ahora resuelve
+// correctamente las clases a sus definiciones completas en los archivos
+// DepthExtractor.cs, DepthExtractorFast.cs y GpuAcceleration*.cs.
+// <<-- FIN DE LA CORRECCIÓN -->>

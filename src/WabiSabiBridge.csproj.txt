@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- Configuración Principal del Proyecto -->
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <LangVersion>latest</LangVersion>
+    <PlatformTarget>x64</PlatformTarget>
+    <AssemblyName>WabiSabiBridge</AssemblyName>
+    <RootNamespace>WabiSabiBridge</RootNamespace>
+    <OutputType>Library</OutputType>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    
+    <!-- Suprime las advertencias de compatibilidad con Windows (CA1416) -->
+    <SupportedOSPlatformVersion>7.0</SupportedOSPlatformVersion>
+
+    <!-- Ruta a tu instalación de Revit 2026 -->
+    <RevitInstallPath>C:\Program Files\Autodesk\Revit 2026</RevitInstallPath>
+    <ResolveAssemblyWarnOrErrorOnTargetArchitectureMismatch>None</ResolveAssemblyWarnOrErrorOnTargetArchitectureMismatch>
+  </PropertyGroup>
+
+  <!-- Define la propiedad EnableGPU para compilación condicional. Por defecto es true. -->
+  <PropertyGroup Condition="'$(EnableGPU)' == ''">
+    <EnableGPU>true</EnableGPU>
+  </PropertyGroup>
+
+  <!-- Referencias a las DLLs de la API de Revit -->
+  <ItemGroup>
+    <Reference Include="RevitAPI">
+      <HintPath>$(RevitInstallPath)\RevitAPI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="RevitAPIUI">
+      <HintPath>$(RevitInstallPath)\RevitAPIUI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+  </ItemGroup>
+  
+  <!-- Dependencias NuGet para ambos modos -->
+  <ItemGroup>
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    
+    <!-- Referencias estándar y limpias a ComputeSharp. -->
+    <PackageReference Include="ComputeSharp" Version="2.1.0" />
+    <PackageReference Include="ComputeSharp.D2D1" Version="2.1.0" />
+    
+  </ItemGroup>
+
+  <!-- Excluir el archivo de shader de la compilación SÓLO cuando EnableGPU es false -->
+  <ItemGroup Condition="'$(EnableGPU)' == 'false'">
+    <Compile Remove="Extractors\Gpu\GpuAccelerationBase.cs" />
+  </ItemGroup>
+
+</Project>

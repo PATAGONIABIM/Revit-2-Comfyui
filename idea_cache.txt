@@ -1,0 +1,65 @@
+La Estrategia del "Caché de Geometría Inteligente": Máximo Rendimiento en Tiempo Real
+La Idea Central
+El problema fundamental de la lentitud no es el cálculo en la GPU (que es increíblemente rápido), sino el costoso peaje que cobra la API de Revit para preparar los datos cada vez que exportamos.
+La solución es simple y potente: dejar de pagar ese peaje en cada exportación. En lugar de reconstruir toda la escena desde cero cada vez que movemos la cámara, lo haremos solo una vez y luego reutilizaremos esa información.
+Separamos el problema en dos partes:
+Lo Estático: La geometría del modelo (muros, ventanas, muebles). Esto no cambia a menos que lo modifiquemos explícitamente.
+Lo Dinámico: La posición de la cámara del observador. Esto cambia constantemente.
+La estrategia consiste en procesar la parte estática una sola vez y luego, en tiempo real, solo actualizar la parte dinámica.
+Los 3 Pilares de la Estrategia (La Analogía del Estudio de Fotografía)
+Imagina que eres un fotógrafo que va a hacer una sesión de fotos de una habitación (tu modelo de Revit).
+Pilar 1: El Caché de Geometría (El "Montaje del Set")
+Esto es el "Camino Lento", pero se recorre muy pocas veces.
+¿Qué es?: Es como montar el set de fotografía por primera vez. Colocas todos los muebles, ajustas las paredes, pones los objetos decorativos. En términos del plugin, es una "exportación interna" del modelo 3D. El plugin recorre toda la geometría visible de Revit y la convierte en un formato simple y ultra-rápido que la GPU puede entender (una lista gigante de triángulos).
+¿Cómo funciona?: Este resultado se guarda en un archivo temporal de alto rendimiento (un "caché"). Este caché es el "set" listo y preparado.
+¿Cuándo ocurre?: Únicamente la primera vez que exportas una vista, o después de que el "set" haya sido modificado.
+Pilar 2: El Flujo Rápido (Mover la Cámara para Tomar Fotos)
+Esto es el "Camino Rápido" y es el que usarás el 99% del tiempo.
+¿Qué es?: Una vez que el set está montado, como fotógrafo, no lo desmontas y vuelves a montar para tomar una foto desde un ángulo diferente. Simplemente mueves tu cámara libremente por la habitación para encontrar el mejor encuadre.
+¿Cómo funciona?: Cuando mueves la cámara en Revit (orbitas, haces zoom) y exportas de nuevo, el plugin hace lo siguiente:
+Detecta que el "set" (el caché de geometría) ya está montado y es válido.
+Se salta por completo el costoso proceso de montaje.
+Obtiene la nueva posición de tu cámara (una operación muy rápida).
+Le dice a la GPU: "Usa el set que ya tienes preparado y saca la foto desde esta nueva posición".
+El Resultado: La GPU genera el mapa de profundidad casi instantáneamente, porque toda la información pesada ya estaba en su memoria, lista para ser usada.
+Pilar 3: La Invalidación Inteligente (Saber Cuándo hay que Reajustar el Set)
+Esta es la "inteligencia" del sistema. ¿Cómo sabe el plugin que el modelo ha cambiado y que el caché antiguo ya no sirve?
+¿Qué es?: Es como si un asistente te avisara si el diseñador de interiores entra y mueve un sofá. En ese momento, sabes que tus fotos anteriores desde ese ángulo ya no son correctas y necesitas reajustar tu set.
+¿Cómo funciona?: El plugin "escucha" los eventos de Revit. Si detecta que un usuario ha movido un muro, borrado una ventana o añadido un mueble, automáticamente marca el caché de geometría como "inválido" o "desactualizado".
+¿Qué pasa después?: La próxima vez que exportes, el plugin verá la marca de "inválido" y ejecutará de nuevo el "Camino Lento" (Pilar 1) para reconstruir el set con los nuevos cambios. Una vez hecho, el ciclo rápido se reanuda.
+Diagrama de Flujo Simplificado
+Generated mermaid
+graph TD
+    subgraph "Acción del Usuario en Revit"
+        A[Mueve la Cámara] --> FAST_PATH;
+        B[Modifica un Muro] --> SLOW_PATH_TRIGGER;
+    end
+
+    subgraph "Lógica del Plugin"
+        SLOW_PATH_TRIGGER["Marca el Caché como INVÁLIDO"] --> C{¿Exportar Vista?};
+        FAST_PATH --> C;
+        
+        C -- Caché Válido? --> IS_VALID;
+        C -- Caché Válido? --> IS_INVALID;
+
+        IS_INVALID{No} -- "Camino Lento" --> D["<b>1. Reconstruir Caché</b><br/>Extraer toda la geometría de Revit.<br/>Guardar en archivo de caché.<br/>Marcar caché como VÁLIDO."];
+        D --> E[<b>2. Obtener Cámara Actual</b>];
+        
+        IS_VALID{Sí} -- "Camino Rápido" --> E;
+
+        E --> F["<b>3. Enviar a GPU:</b><br/> - Puntero al Caché de Geometría<br/> - Coordenadas de la Cámara"];
+    end
+
+    subgraph "Procesamiento Final"
+        F --> G["<b>Cálculo en GPU</b><br/>(Renderizado Instantáneo)"];
+        G --> H[Mapa de Profundidad Final];
+    end
+Use code with caution.
+Mermaid
+El Resultado Final en la Experiencia de Usuario
+Antes (Sin Caché): Cada clic en "Exportar" se siente igual de lento, porque siempre se reconstruye todo el "set".
+Después (Con Caché Inteligente):
+Primera Exportación: Lenta (el "set" se está montando).
+Movimientos de Cámara: Se sienten instantáneos (solo estás moviendo la cámara).
+Tras Modificar el Modelo: La siguiente exportación será lenta de nuevo (el "set" se reajusta), y luego volverá a ser instantánea.
+Esta arquitectura transforma el plugin de una herramienta de exportación secuencial a una plataforma de visualización verdaderamente interactiva y de alto rendimiento.

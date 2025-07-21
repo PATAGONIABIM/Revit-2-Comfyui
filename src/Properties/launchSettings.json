@@ -1,0 +1,11 @@
+{
+  "profiles": {
+    "WabiSabiBridge": {
+      "commandName": "Project",
+      "workingDirectory": "C:\\Program Files\\Autodesk\\Revit 2026"
+    },
+    "Perfil 1": {
+      "commandName": "Project"
+    }
+  }
+}

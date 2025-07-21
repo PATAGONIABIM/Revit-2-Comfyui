@@ -1,0 +1,234 @@
+Plan de Acción: Implementación de Caché de Geometría Inteligente
+Objetivo Principal: Modificar el "Modo Experimental" para que la costosa extracción de geometría se realice solo una vez (o cuando el modelo cambie), permitiendo que los movimientos de cámara se procesen de forma casi instantánea utilizando los datos cacheados.
+Fase 1: Crear el Gestor del Caché de Geometría
+Concepto: Crearemos una nueva clase dedicada, GeometryCacheManager, que será la única responsable de crear, gestionar, invalidar y servir los datos de la geometría.
+Pasos Concretos:
+Crear el Archivo GeometryCacheManager.cs:
+Ubícalo en WabiSabiBridge/Extractors/Cache/GeometryCacheManager.cs.
+Esta clase debe ser un Singleton (solo una instancia) para que sea accesible desde toda la aplicación.
+Debe implementar IDisposable para limpiar los recursos (el Memory-Mapped File) al cerrar Revit.
+Definir la Estructura del GeometryCacheManager:
+Generated csharp
+// En GeometryCacheManager.cs
+public class GeometryCacheManager : IDisposable
+{
+    public static GeometryCacheManager Instance { get; } = new GeometryCacheManager();
+
+    private MemoryMappedFile? _geometryMmf;
+    private bool _isCacheValid = false;
+    private string _lastViewName = string.Empty;
+
+    // Propiedades públicas para que otros accedan a los datos
+    public bool IsCacheValid => _isCacheValid;
+    public MemoryMappedFile? GeometryMmf => _geometryMmf;
+    public int VertexCount { get; private set; }
+    public int TriangleCount { get; private set; }
+
+    private GeometryCacheManager() { } // Constructor privado para Singleton
+
+    // Método principal que orquestará todo
+    public void EnsureCacheIsValid(Document doc, View3D view3D, Action<string, Color> updateStatusCallback)
+    {
+        // Si la vista cambió o el caché fue invalidado, reconstruir.
+        if (!_isCacheValid || view3D.Name != _lastViewName)
+        {
+            updateStatusCallback("Caché inválido. Reconstruyendo geometría (proceso único)...", Color.Orange);
+            RebuildCache(doc, view3D, updateStatusCallback);
+        }
+    }
+
+    private void RebuildCache(Document doc, View3D view3D, Action<string, Color> updateStatusCallback)
+    {
+        // <<-- MOVER LÓGICA AQUÍ -->>
+        // 1. Mover toda la lógica de `ExtractSceneGeometry` desde DepthExtractor.cs a este método.
+        // 2. Extraer los vértices y triángulos.
+        // 3. Crear el MemoryMappedFile (`_geometryMmf`) y escribir los datos.
+        // 4. Guardar VertexCount y TriangleCount.
+        // 5. Marcar el caché como válido:
+        _isCacheValid = true;
+        _lastViewName = view3D.Name;
+        updateStatusCallback("Caché de geometría generado.", Color.Blue);
+    }
+
+    // Método para ser llamado desde el exterior
+    public void InvalidateCache()
+    {
+        _isCacheValid = false;
+    }
+
+    public void Dispose()
+    {
+        _geometryMmf?.Dispose();
+    }
+}
+Use code with caution.
+C#
+Fase 2: Implementar la Invalidación Automática del Caché
+Concepto: Haremos que el plugin escuche los cambios en el modelo de Revit y, si se modifica la geometría, invalide automáticamente el caché.
+Pasos Concretos:
+Modificar WabiSabiBridgeApp.cs:
+En el método OnStartup, nos suscribiremos al evento DocumentChanged.
+En el método OnShutdown, nos desuscribiremos y llamaremos a Dispose en nuestro gestor de caché.
+Generated csharp
+// En WabiSabiBridgeApp.cs
+public class WabiSabiBridgeApp : IExternalApplication
+{
+    public Result OnStartup(UIControlledApplication application)
+    {
+        // ... (código existente del ribbon)
+
+        // Suscribirse al evento de cambios en el documento
+        application.ControlledApplication.DocumentChanged += OnDocumentChanged;
+
+        return Result.Succeeded;
+    }
+
+    public Result OnShutdown(UIControlledApplication application)
+    {
+        // Desuscribirse del evento
+        application.ControlledApplication.DocumentChanged -= OnDocumentChanged;
+
+        // Limpiar el caché al cerrar Revit
+        WabiSabiBridge.Extractors.Cache.GeometryCacheManager.Instance.Dispose();
+
+        return Result.Succeeded;
+    }
+
+    // El gestor de eventos
+    private void OnDocumentChanged(object sender, Autodesk.Revit.DB.Events.DocumentChangedEventArgs e)
+    {
+        // Obtener los IDs de los elementos modificados
+        ICollection<ElementId> modifiedElementIds = e.GetModifiedElementIds();
+
+        // Si se añadió, borró o modificó algún elemento, invalidamos el caché.
+        // (Optimización futura: comprobar si los elementos modificados eran visibles).
+        if (e.GetAddedElementIds().Any() || e.GetDeletedElementIds().Any() || modifiedElementIds.Any())
+        {
+            WabiSabiBridge.Extractors.Cache.GeometryCacheManager.Instance.InvalidateCache();
+        }
+    }
+}
+Use code with caution.
+C#
+Fase 3: Integrar el Flujo de Caché en la Exportación
+Concepto: Modificaremos el flujo de exportación existente para que utilice nuestro nuevo GeometryCacheManager en lugar de extraer la geometría cada vez.
+Pasos Concretos:
+Refactorizar ExportEventHandler.cs:
+El método Execute cambiará drásticamente cuando el "Modo Experimental" esté activo.
+Generated csharp
+// En ExportEventHandler.cs, dentro del método Execute()
+// ... (después de obtener la vista 3D)
+
+if (UseGeometryExtraction && UseGpuAcceleration)
+{
+    // --- INICIO DEL NUEVO FLUJO ---
+
+    // 1. Obtener el gestor de caché
+    var cacheManager = WabiSabiBridge.Extractors.Cache.GeometryCacheManager.Instance;
+
+    // 2. Asegurarse de que el caché está listo (esto lo reconstruye si es necesario)
+    cacheManager.EnsureCacheIsValid(doc, view3D, UpdateStatusCallback);
+
+    if (!cacheManager.IsCacheValid || cacheManager.GeometryMmf == null)
+    {
+        UpdateStatusCallback?.Invoke("Error: No se pudo generar el caché de geometría.", Drawing.Color.Red);
+        return;
+    }
+
+    // 3. Obtener los datos de la cámara (esto es siempre rápido)
+    var viewOrientation = view3D.GetOrientation();
+    var eyePosition = viewOrientation.EyePosition;
+    // ... obtener forwardDirection, upDirection, etc.
+
+    // 4. Preparar la configuración para la GPU
+    var config = new RayTracingConfig
+    {
+        EyePosition = new Float3((float)eyePosition.X, ...),
+        // ... resto de la configuración de cámara y resolución
+    };
+
+    // 5. Ejecutar en GPU, pero con una nueva firma que usa el caché
+    // NOTA: Esto requerirá modificar IGpuAccelerationManager y sus clases.
+    UpdateStatusCallback?.Invoke("Renderizando con caché (GPU)...", Drawing.Color.Blue);
+
+    // La GPU ahora lee directamente desde el MemoryMappedFile del caché
+    float[] gpuDepthBuffer = await _gpuManager.ExecuteDepthRayTracingAsync(
+        cacheManager.GeometryMmf, // <-- Pasamos el MMF
+        cacheManager.VertexCount,
+        cacheManager.TriangleCount,
+        config
+    );
+
+    // ... Procesar gpuDepthBuffer y guardar la imagen ...
+
+    // --- FIN DEL NUEVO FLUJO ---
+}
+else if (ExportDepth) // El flujo antiguo para modos no experimentales permanece igual
+{
+    // ... código existente para DepthExtractor y DepthExtractorFast ...
+}
+Use code with caution.
+C#
+Modificar DepthExtractor.cs:
+Eliminar el método ExtractSceneGeometry y toda la lógica de extracción de geometría. Su responsabilidad ha sido transferida al GeometryCacheManager.
+El método ProcessWithGeometryExtractionGpu ahora se vuelve muy simple o se elimina, ya que la lógica principal estará en ExportEventHandler.
+Modificar IGpuAccelerationManager y sus implementaciones (GpuAccelerationBase.cs, etc.):
+La firma del método ExecuteDepthRayTracingAsync debe cambiar para aceptar el MemoryMappedFile en lugar de un objeto ExtractedGeometry.
+Generated csharp
+// Interfaz en GpuSharedTypes.cs
+public interface IGpuAccelerationManager : IDisposable
+{
+    // ...
+    // Firma ANTERIOR: Task<float[]> ExecuteDepthRayTracingAsync(ExtractedGeometry geometry, RayTracingConfig config);
+    // Firma NUEVA:
+    Task<float[]> ExecuteDepthRayTracingAsync(MemoryMappedFile mmf, int vertexCount, int triangleCount, RayTracingConfig config);
+}
+
+// Implementación en GpuAccelerationBase.cs
+public async Task<float[]> ExecuteDepthRayTracingAsync(MemoryMappedFile mmf, int vertexCount, int triangleCount, RayTracingConfig config)
+{
+    // Dentro de este método, en lugar de recibir los arrays de vértices/índices,
+    // se crea un `MemoryMappedViewAccessor` a partir del `mmf` para leer los datos
+    // y pasarlos a los búferes de la GPU.
+    using (var accessor = mmf.CreateViewAccessor())
+    {
+        // ... leer desde el accessor y ejecutar el shader ...
+    }
+}
+Use code with caution.
+C#
+Fase 4: Refinar la Interfaz de Usuario y la Experiencia
+Concepto: Darle al usuario control y retroalimentación sobre el nuevo sistema de caché.
+Pasos Concretos:
+Modificar WabiSabiBridgeWindow.cs:
+Añadir un nuevo botón en la interfaz.
+Generated csharp
+// En WabiSabiBridgeWindow.cs
+private WinForms.Button _forceRecacheButton = null!;
+
+// En InitializeComponent()
+_forceRecacheButton = new WinForms.Button
+{
+    Text = "Forzar Reconstrucción de Caché",
+    Dock = WinForms.DockStyle.Fill,
+    BackColor = Drawing.Color.LightCoral
+};
+_forceRecacheButton.Click += (s, e) =>
+{
+    WabiSabiBridge.Extractors.Cache.GeometryCacheManager.Instance.InvalidateCache();
+    _statusLabel.Text = "Caché invalidado. Se reconstruirá en la próxima exportación.";
+    _statusLabel.ForeColor = Drawing.Color.Orange;
+};
+
+// Añadirlo al layout
+mainLayout.Controls.Add(_forceRecacheButton, 0, 8); // Ajustar el índice de la fila
+Use code with caution.
+C#
+Mejorar los Mensajes de Estado:
+Ya hemos incluido esto en los pasos anteriores, pero es crucial que el UpdateStatusCallback se utilice para informar al usuario si se está usando el caché ("Renderizando con caché (rápido)...") o si se está reconstruyendo ("Reconstruyendo geometría (proceso único)..."). Esto gestionará las expectativas de rendimiento.
+Resumen del Resultado Final
+Con este plan implementado:
+La primera exportación en modo experimental será lenta, ya que construirá el caché y mostrará el estado "Reconstruyendo geometría...".
+Las exportaciones subsecuentes (si solo se mueve la cámara) serán casi instantáneas. La GPU simplemente renderizará el caché existente desde el nuevo punto de vista.
+Si el usuario modifica el modelo, el caché se invalidará silenciosamente en segundo plano. La siguiente exportación volverá a ser lenta (reconstruirá el caché) y luego el ciclo rápido se reanudará.
+El usuario tendrá un botón para forzar esta reconstrucción si sospecha que el caché está desactualizado por alguna razón.
