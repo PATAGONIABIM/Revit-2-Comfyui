@@ -1,0 +1,8 @@
+# Excluir carpetas de compilación y temporales
+**/bin
+**/obj
+**/.vs
+
+# Excluir documentación y propiedades
+**/docs
+**/properties

@@ -1,0 +1,71 @@
+# Archivo .gitignore para un proyecto de C#/.NET en Visual Studio
+
+## Carpetas de salida de compilación
+# Contienen los binarios compilados y archivos intermedios. [1, 2] 
+# Se generan cada vez que compilas el proyecto.
+[Bb]in/
+[Oo]bj/
+
+## Archivos y carpetas específicos de Visual Studio
+# La carpeta .vs almacena información específica del usuario y de la sesión, 
+# como los archivos que tienes abiertos, puntos de interrupción, etc. [14, 22, 23]
+.vs/
+
+# Archivos de opciones de usuario de Visual Studio. Contienen configuraciones locales
+# que no deben ser compartidas entre desarrolladores.
+*.suo
+*.user
+
+## Directorios y archivos específicos del proyecto solicitados
+# Carpetas de documentación y configuración del proyecto que no deseas versionar.
+docs/
+properties/
+
+## Archivos de paquetes NuGet
+# Los paquetes se deben restaurar, no almacenar en el repositorio.
+packages/
+*.nupkg
+
+## Archivos generados por herramientas y extensiones
+# Resharper (una extensión popular de Visual Studio)
+_ReSharper*/
+*.[Rr]e[Ss]harper
+*.DotSettings.user
+
+# Archivos de caché de Visual Studio
+*.Cache
+*.cache
+*.pyc
+*.pyo
+__pycache__/
+
+## Archivos de sistema operativo y temporales
+# Archivos del sistema operativo que pueden aparecer en la carpeta del proyecto.
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Archivos de respaldo y temporales
+*.[Bb]ak
+*.[Tt]mp
+
+## Registros (Logs)
+# Es común excluir los archivos de registro, ya que cambian constantemente.
+*.log
+logs/
+
+## Configuración de publicación
+# Contiene perfiles de publicación con información sensible.
+*.Publish.xml
+*.pubxml
+*.publishsettings
+
+## Otros archivos de Visual Studio
+*.sdf
+*.opensdf
+*.vsp
+*.vspx
+*.psess
+
+# Entorno de Visual Studio Code (si se usa)
+.vscode/

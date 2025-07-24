@@ -1,8 +1,0 @@
-﻿<?xml version="1.0" encoding="utf-8" standalone="no"?>
-<Project ToolsVersion="14.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
-  <ImportGroup Condition=" '$(ExcludeRestorePackageImports)' != 'true' ">
-    <Import Project="$(NuGetPackageRoot)computesharp.core\2.1.0\buildTransitive\ComputeSharp.Core.targets" Condition="Exists('$(NuGetPackageRoot)computesharp.core\2.1.0\buildTransitive\ComputeSharp.Core.targets')" />
-    <Import Project="$(NuGetPackageRoot)computesharp.d2d1\2.1.0\buildTransitive\ComputeSharp.D2D1.targets" Condition="Exists('$(NuGetPackageRoot)computesharp.d2d1\2.1.0\buildTransitive\ComputeSharp.D2D1.targets')" />
-    <Import Project="$(NuGetPackageRoot)computesharp\2.1.0\buildTransitive\ComputeSharp.targets" Condition="Exists('$(NuGetPackageRoot)computesharp\2.1.0\buildTransitive\ComputeSharp.targets')" />
-  </ImportGroup>
-</Project>

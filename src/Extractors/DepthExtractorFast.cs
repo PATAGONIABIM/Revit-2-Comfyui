@@ -199,7 +199,7 @@ namespace WabiSabiBridge.Extractors
             }
         }
         
-        public void ExtractDepthMap(View3D view3D, string outputPath, string timestamp, int width, int height, IList<XYZ> viewCorners)
+        public double[,] ExtractDepthMap(View3D view3D, int width, int height, IList<XYZ> viewCorners)
         {
             Document doc = _uiApp.ActiveUIDocument.Document;
             
@@ -265,9 +265,8 @@ namespace WabiSabiBridge.Extractors
             }
             
             // Generar imagen final
-            GenerateDepthImage(finalDepth, width, height, outputPath, timestamp);
-            
             System.Diagnostics.Debug.WriteLine("=== End WabiSabi Depth Fast Debug ===");
+            return finalDepth;
         }
         
         /// <summary>
