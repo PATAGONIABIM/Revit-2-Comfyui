@@ -333,9 +333,18 @@ namespace WabiSabiBridge.DirectContext
         // CAMBIO: Retornar un bounding box grande para asegurar que siempre se ejecute
         public Outline? GetBoundingBox(View view)
         {
-            // Retornar null indica que el servidor debe ser llamado siempre
-            // independientemente de la región visible
-            return null;
+            // Esta es la "mentira piadosa" que fuerza a Revit a llamarnos.
+            // Le decimos a Revit que nuestra "geometría" es una caja enorme
+            // que va desde -1 millón a +1 millón en todas las direcciones.
+            // De esta forma, no importa dónde esté la cámara, Revit pensará que
+            // nuestro servidor está visible y DEBE llamar a RenderScene.
+            // Esto es lo que finalmente nos meterá en el bucle de renderizado.
+            
+            double size = 1000000.0;
+            XYZ min = new XYZ(-size, -size, -size);
+            XYZ max = new XYZ(size, size, size);
+            
+            return new Outline(min, max);
         }
 
         public bool UsesHandles()
@@ -378,58 +387,36 @@ namespace WabiSabiBridge.DirectContext
         // Todo el trabajo de extracción se realiza aquí.
         public void RenderScene(View view, DisplayStyle displayStyle)
         {
+            WabiSabiLogger.Log("RenderScene llamado!", LogLevel.Info);
             lock (_statsLock)
             {
                 _drawCallCount++;
             }
 
+            // Solo continuamos si la captura está activa desde la UI.
+            if (!_isCapturingContinuously || view is not View3D view3D)
+            {
+                return;
+            }
+
             try
             {
-                // Log crítico para confirmar que el método se está llamando
-                if (_drawCallCount == 1)
-                {
-                    WabiSabiLogger.Log("¡RenderScene llamado por PRIMERA VEZ!", LogLevel.Info);
-                }
-                else if (_drawCallCount % 10 == 0)
-                {
-                    WabiSabiLogger.Log($"RenderScene llamado: {_drawCallCount} veces", LogLevel.Info);
-                }
+                var currentOrientation = view3D.GetOrientation();
 
-                if (view == null || view.ViewType != ViewType.ThreeD)
+                // La única condición ahora es si la cámara REALMENTE se movió.
+                if (HasOrientationChanged(currentOrientation))
                 {
-                    if (_drawCallCount == 1)
-                    {
-                        WabiSabiLogger.LogError("RenderScene: Vista nula o no es 3D");
-                    }
-                    return;
-                }
-
-                var view3D = view as View3D;
-                if (view3D == null) return;
-
-                // Extraer datos de cámara
-                bool shouldExtract = ShouldExtractCameraData();
-                
-                if (shouldExtract)
-                {
-                    ViewOrientation3D? currentOrientation = GetViewOrientationSafely(view3D);
+                    // Creamos una copia para la siguiente comparación.
+                    _lastOrientation = CopyOrientation(currentOrientation);
                     
-                    if (currentOrientation != null && ExtractCameraData(view3D, currentOrientation))
+                    // Creamos y escribimos el paquete de datos en el buffer.
+                    var cameraData = CreateCameraData(currentOrientation);
+                    if (WriteToBufferSafely(cameraData))
                     {
-                        _lastOrientation = CopyOrientation(currentOrientation);
-                        _lastExtractionTime = Stopwatch.GetTimestamp();
-                        _lastDrawTime = DateTime.Now;
-                        
                         IncrementSuccessfulExtractions();
-                        
-                        // Log de éxito
-                        if (_successfulExtractions == 1)
+                        if (_successfulExtractions % 10 == 0) // Log ocasional para no saturar
                         {
-                            WabiSabiLogger.Log($"¡PRIMERA extracción exitosa! Seq: {_instanceSequenceNumber}", LogLevel.Info);
-                        }
-                        else if (_successfulExtractions % 10 == 0)
-                        {
-                            WabiSabiLogger.Log($"Extracción exitosa #{_successfulExtractions}, Seq: {_instanceSequenceNumber}", LogLevel.Info);
+                            WabiSabiLogger.Log($"Extracción exitosa #{_successfulExtractions}, Seq: {cameraData.SequenceNumber}", LogLevel.Debug);
                         }
                     }
                 }
@@ -439,9 +426,6 @@ namespace WabiSabiBridge.DirectContext
                 WabiSabiLogger.LogError("Error crítico en RenderScene", ex);
                 IncrementFailedExtractions();
             }
-            
-            // IMPORTANTE: No crear ningún buffer gráfico, solo extraer datos
-            // Retornar inmediatamente para minimizar overhead
         }
     }
 

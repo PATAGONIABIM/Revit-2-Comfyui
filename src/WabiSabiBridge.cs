@@ -4,6 +4,7 @@ using System.IO;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
+
 using System.Drawing.Imaging;
 using System.Diagnostics;
 using Newtonsoft.Json;
@@ -137,7 +138,58 @@ namespace WabiSabiBridge
             }
         }
     }
-    
+
+
+    public class CameraPollingEventHandler : IExternalEventHandler
+    {
+        private ViewOrientation3D? _lastKnownOrientation;
+        private static readonly double XYZ_TOLERANCE = 1e-6;
+
+        public void Execute(UIApplication app)
+        {
+            try
+            {
+                var uiDoc = app?.ActiveUIDocument;
+                if (uiDoc?.Document == null || uiDoc.ActiveView is not View3D view3D)
+                {
+                    return;
+                }
+
+                var orientation = view3D.GetOrientation();
+                if (HasOrientationChanged(orientation))
+                {
+                    _lastKnownOrientation = new ViewOrientation3D(orientation.EyePosition, orientation.UpDirection, orientation.ForwardDirection);
+
+                    var cameraData = new CameraData
+                    {
+                        EyePosition = orientation.EyePosition,
+                        ViewDirection = orientation.ForwardDirection,
+                        UpDirection = orientation.UpDirection,
+                        SequenceNumber = Interlocked.Increment(ref WabiSabiBridgeApp._globalSequenceNumber),
+                        Timestamp = Stopwatch.GetTimestamp()
+                    };
+
+                    // Escribimos directamente al buffer del WabiSabiBridgeApp
+                    WabiSabiBridgeApp._cameraBuffer?.TryWrite(cameraData);
+                }
+            }
+            catch
+            {
+                // Ignorar errores durante la captura rápida
+            }
+        }
+
+        private bool HasOrientationChanged(ViewOrientation3D newOrientation)
+        {
+            if (_lastKnownOrientation == null) return true;
+            if (!newOrientation.EyePosition.IsAlmostEqualTo(_lastKnownOrientation.EyePosition, XYZ_TOLERANCE)) return true;
+            if (!newOrientation.ForwardDirection.IsAlmostEqualTo(_lastKnownOrientation.ForwardDirection, XYZ_TOLERANCE)) return true;
+            if (!newOrientation.UpDirection.IsAlmostEqualTo(_lastKnownOrientation.UpDirection, XYZ_TOLERANCE)) return true;
+            return false;
+        }
+
+        public string GetName() => "WabiSabi Bridge Camera Polling Event Handler";
+    }
     /// <summary>
     /// Handler para ejecutar exportaciones en el contexto válido de Revit
     /// </summary>
@@ -164,15 +216,68 @@ namespace WabiSabiBridge
         {
             try
             {
-                UpdateStatusCallback?.Invoke("Capturando vista...", System.Drawing.Color.Blue);
                 UIDocument uiDoc = app.ActiveUIDocument;
                 Document doc = uiDoc.Document;
 
                 if (doc.ActiveView is not View3D view3D) return;
 
+                ViewOrientation3D? orientation; // Usamos un nullable para la orientación
+
+                // --- INICIO DE CIRUGÍA: LÓGICA HÍBRIDA ---
+
+                // PASO 1: INTENTAR OBTENER DATOS DEL BUFFER (MODO AUTO-EXPORT)
+                CameraData latestCameraData = default;
+                bool hasDataFromBuffer = false;
+                
+                if (WabiSabiBridgeApp._cameraBuffer != null)
+                {
+                    while (WabiSabiBridgeApp._cameraBuffer.TryRead(out CameraData data))
+                    {
+                        latestCameraData = data;
+                        hasDataFromBuffer = true;
+                    }
+                }
+
+                if (hasDataFromBuffer)
+                {
+                    // Hay datos del journal, estamos en modo AUTO-EXPORT
+                    
+                    // Verificamos que no estemos procesando un fotograma antiguo
+                    if (latestCameraData.SequenceNumber <= WabiSabiBridgeApp._lastProcessedSequenceNumber)
+                    {
+                        return; // Salir si ya hemos procesado este frame o uno más nuevo
+                    }
+                    WabiSabiBridgeApp._lastProcessedSequenceNumber = latestCameraData.SequenceNumber;
+
+                    // Creamos la orientación a partir de los datos del buffer
+                    orientation = new ViewOrientation3D(
+                        latestCameraData.EyePosition, 
+                        latestCameraData.UpDirection, 
+                        latestCameraData.ViewDirection);
+                    
+                    WabiSabiLogger.LogDiagnostic("Export", $"Exportando frame de Auto-Export. Seq: {latestCameraData.SequenceNumber}");
+                }
+                else
+                {
+                    // No hay datos en el buffer, asumimos que es una EXPORTACIÓN MANUAL
+                    
+                    // Obtenemos la orientación de la forma tradicional, desde la vista activa
+                    orientation = view3D.GetOrientation();
+                    WabiSabiLogger.LogDiagnostic("Export", "Exportando por petición manual.");
+                }
+                
+                // Si por alguna razón no tenemos orientación, salimos.
+                if (orientation == null) return;
+
+                // --- FIN DE CIRUGÍA ---
+
+                UpdateStatusCallback?.Invoke("Capturando vista...", System.Drawing.Color.Blue);
+
                 // --- TAREA 1: Recolectar datos de Revit ---
+                // El resto del método ahora usa la variable 'orientation', que está
+                // garantizada de tener un valor correcto para CUALQUIERA de los dos casos.
                 string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmssfff");
-                var orientation = view3D.GetOrientation();
+                
                 bool isCropActive = view3D.CropBoxActive;
                 BoundingBoxUV outline = view3D.Outline;
                 var uiView = uiDoc.GetOpenUIViews().FirstOrDefault(v => v.ViewId == view3D.Id);
@@ -983,8 +1088,23 @@ namespace WabiSabiBridge
             };
             
             _autoExportCheckBox.CheckedChanged += (s, e) => {
+                // 1. Actualizar y guardar la configuración como antes
                 _config.AutoExport = _autoExportCheckBox.Checked;
                 _config.Save();
+
+                // 2. AVISAR AL SISTEMA EN TIEMPO REAL (ESTA ES LA LÍNEA CLAVE)
+                // Se le pasa el nuevo estado (activado/desactivado) y la instancia de la aplicación de Revit.
+                WabiSabiBridgeApp.SetAutoExportEnabled(_autoExportCheckBox.Checked, _uiApp);
+
+                // 3. (Opcional) Informar al usuario en la barra de estado
+                if (_autoExportCheckBox.Checked)
+                {
+                    UpdateStatus("Auto-export activado. Mueve la cámara.", Drawing.Color.Green);
+                }
+                else
+                {
+                    UpdateStatus("Auto-export desactivado.", Drawing.Color.Orange);
+                }
             };
             
             _autoDepthCheckBox.CheckedChanged += (s, e) => {
@@ -1140,41 +1260,41 @@ namespace WabiSabiBridge
     /// </summary>
     public class WabiSabiBridgeApp : IExternalApplication
     {
-        private static CameraDataExtractionServer? _currentServer;
-        private static readonly Dictionary<Document, CameraDataExtractionServer> _documentServers = new();
-        private static LockFreeCameraRingBuffer? _cameraBuffer;
-        private static MemoryMappedFile? _cameraMmf;
-        private static MemoryMappedViewAccessor? _cameraAccessor;
-        private static Thread? _streamerThread;
-        private static CancellationTokenSource? _cancellationTokenSource;
-        private const string MmfName = "WabiSabiBridge_CameraStream";
+        // --- SECCIÓN 1: Eventos y Handlers Principales de la Aplicación ---
         internal static ExternalEvent? WabiSabiEvent;
         internal static ExportEventHandler? WabiSabiEventHandler;
         private static readonly WabiSabiConfig _config = WabiSabiConfig.Load();
-        private static int _lastKnownSequenceNumber = -1;
-        private static int _globalSequenceNumber = -1;
-        private static int _lastProcessedSequenceNumber = -1;
-        private static long _lastCameraMoveTimestamp = 0;
-        private static long _lastExportTimestamp = 0;
-
-        private static System.Windows.Forms.Timer? _viewInvalidationTimer;
-        private static System.Windows.Forms.Timer? _directCaptureTimer;
         private static UIApplication? _currentUiApp;
-        private static bool _isContinuousCaptureActive = false;
-        private static long _lastInvalidationTime = 0;
-        private const long INVALIDATION_INTERVAL_MS = 33; // ~30 FPS para invalidación    
+        private static bool _isInitialized = false;
 
+        // --- SECCIÓN 2: Sistema de Sondeo de Cámara (La Nueva Arquitectura) ---
+        
+        internal static LockFreeCameraRingBuffer? _cameraBuffer;
+        private static Task? _consumerTask;
+        private static CancellationTokenSource? _consumerCts;
+        private static JournalMonitor? _journalMonitor;
+        public static string RevitVersion { get; private set; } = "2026";
+
+        // --- SECCIÓN 3: Lógica de Auto-Export (Controlada por OnIdling) ---
+        private static bool _isContinuousCaptureActive = false;
+        internal static int _globalSequenceNumber = -1; // internal permite el acceso desde el mismo ensamblado
+        internal static int _lastProcessedSequenceNumber = -1;
+        private static long _lastCameraMoveTimestamp = 0;
+        // --- INICIO DE CIRUGÍA 1: AÑADIR TIMESTAMP DEL LIMITADOR ---
+        private static long _lastFrameTimestamp = 0;
+        // Intervalo de exportación en milisegundos. 1000ms / 12 FPS = ~83ms
+        private const long EXPORT_INTERVAL_MS = 83; 
+        private static ViewOrientation3D? _lastKnownOrientation; // Podría vivir en el handler, pero aquí es aceptable
+        private static readonly double XYZ_TOLERANCE = 1e-6;
+        private static volatile bool _pollingRequested = false;
+
+        // --- SECCIÓN 4: Sistema de Cola de Exportación (Para Procesamiento en Segundo Plano) ---
         internal static readonly ConcurrentQueue<ExportJob> _exportQueue = new ConcurrentQueue<ExportJob>();
         private static Task? _exportWorker;
-        private static CancellationTokenSource? _exportCts;   
+        private static CancellationTokenSource? _exportCts;
         
-        private static bool _isInitialized = false;
-        private static int _idlingCallCount = 0;
-        private static readonly HashSet<Document> _pendingRegistrations = new HashSet<Document>();
-        private static ViewOrientation3D? _lastKnownOrientation;
-        private static readonly double XYZ_TOLERANCE = 1e-6; // Tolerancia para comparar vectores flotantes
 
-        private static volatile bool _invalidationRequested = false;
+        
 
         public Result OnStartup(UIControlledApplication application)
         {
@@ -1189,22 +1309,23 @@ namespace WabiSabiBridge
                 
                 if (!CreateRibbon(application)) return Result.Failed;
                 if (!InitializeEventHandler()) return Result.Failed;
-                if (!SubscribeToRevitEvents(application)) return Result.Failed;
+                
 
-                // --- CAMBIO: INICIAMOS EL SISTEMA DE STREAMING SIEMPRE ---
-                // La lógica de si se exporta o no, se controlará en OnIdling.
-                // Esto evita el ciclo frágil de registrar/desregistrar el servidor.
-                InitializeStreamingSystem(); 
+                
+                
+                RevitVersion = application.ControlledApplication.VersionNumber;
+                _cameraBuffer = new LockFreeCameraRingBuffer(128);
+                _journalMonitor = new JournalMonitor(_cameraBuffer);
+                WabiSabiLogger.Log("Sistema JournalMonitor inicializado.", LogLevel.Info);
 
-                _isInitialized = true;
-                WabiSabiLogger.Log("WabiSabi Bridge iniciado con éxito", LogLevel.Info);
+                
                 // INICIAR EL HILO CONSUMIDOR DE EXPORTACIONES
                 _exportCts = new CancellationTokenSource();
                 _exportWorker = Task.Run(() => ProcessExportQueue(_exportCts.Token));
                 WabiSabiLogger.Log("Hilo de trabajo de exportación iniciado.", LogLevel.Info);
 
                 _isInitialized = true;
-                RunDiagnostics();
+                //RunDiagnostics();
                 return Result.Succeeded;
             }
             catch (Exception ex)
@@ -1214,24 +1335,48 @@ namespace WabiSabiBridge
                 return Result.Failed;
             }
         }
-        /// <summary>
-        /// Este evento se dispara por el Timer en el hilo de la UI, 
-        /// garantizando una captura de cámara constante.
-        /// </summary>
-        private static void DirectCaptureTimer_Tick(object? sender, EventArgs e)
-        {
-            // Solo capturamos si la opción está activa y tenemos una app de Revit
-            if (_isContinuousCaptureActive && _currentUiApp != null)
-            {
-                CaptureCameraDataDirectly(_currentUiApp.ActiveUIDocument);
-            }
-            else
-            {
-                // Si por alguna razón el tick se ejecuta cuando no debe, detenemos el timer.
-                _directCaptureTimer?.Stop();
-            }
-        }
 
+        private static async Task ConsumerLoop(CancellationToken token)
+        {
+            WabiSabiLogger.Log("Hilo Consumidor/Limitador iniciado a 12 FPS.", LogLevel.Info);
+            // Intervalo de exportación en milisegundos. 1000ms / 12 FPS = ~83ms
+            const int EXPORT_INTERVAL_MS = 83;
+
+            while (!token.IsCancellationRequested)
+            {
+                try
+                {
+                    // 1. Esperar el intervalo para limitar la velocidad a ~12 FPS
+                    await Task.Delay(EXPORT_INTERVAL_MS, token);
+
+                    // 2. Vaciar el buffer para obtener la posición de cámara más reciente
+                    CameraData latestData = default;
+                    bool hasData = false;
+                    while (_cameraBuffer!.TryRead(out CameraData data))
+                    {
+                        latestData = data;
+                        hasData = true;
+                    }
+
+                    // 3. Si encontramos datos nuevos que no hemos procesado...
+                    if (hasData && latestData.SequenceNumber > _lastProcessedSequenceNumber)
+                    {
+                        // Actualizamos el último procesado para no repetir
+                        _lastProcessedSequenceNumber = latestData.SequenceNumber;
+                        
+                        // Levantamos la bandera para que Revit ejecute la exportación
+                        // cuando pueda. Le estamos entregando el "testigo".
+                        WabiSabiEvent?.Raise();
+                    }
+                }
+                catch (TaskCanceledException) { break; }
+                catch (Exception ex)
+                {
+                    WabiSabiLogger.LogError("Error en el Hilo Consumidor", ex);
+                }
+            }
+            WabiSabiLogger.Log("Hilo Consumidor/Limitador detenido.", LogLevel.Info);
+        }
         /// <summary>
         /// Se ejecuta en un hilo de fondo, procesando trabajos de la cola sin bloquear la UI.
         /// </summary>
@@ -1347,122 +1492,40 @@ namespace WabiSabiBridge
         }
 
         public string GetName() => "WabiSabi Bridge Export Event";
-        
-
+               
         /// <summary>
         /// Activa o desactiva dinámicamente el sistema de streaming para la exportación automática.
         /// </summary>
         public static void SetAutoExportEnabled(bool enabled, UIApplication? uiApp)
         {
-            WabiSabiLogger.Log($"SetAutoExportEnabled (Arquitectura Timer) llamado con: {enabled}", LogLevel.Info);
-            
+            WabiSabiLogger.Log($"SetAutoExportEnabled (Arquitectura 3 Hilos) llamado con: {enabled}", LogLevel.Info);
             _config.AutoExport = enabled;
             _config.Save();
-            _currentUiApp = uiApp;
             _isContinuousCaptureActive = enabled;
 
             if (enabled)
             {
-                // Si el timer no existe, lo creamos
-                if (_directCaptureTimer == null)
-                {
-                    _directCaptureTimer = new System.Windows.Forms.Timer();
-                    _directCaptureTimer.Interval = 50; // Capturar ~20 veces por segundo
-                    _directCaptureTimer.Tick += DirectCaptureTimer_Tick;
-                }
-                
-                // Reiniciamos contadores y empezamos el timer
-                _globalSequenceNumber = -1;
+                // Reiniciar contadores
                 _lastProcessedSequenceNumber = -1;
-                _lastCameraMoveTimestamp = 0;
-                _directCaptureTimer.Start();
-                
-                WabiSabiLogger.Log($"Timer de captura directa iniciado ({_directCaptureTimer.Interval}ms).", LogLevel.Info);
+                _globalSequenceNumber = -1;
+
+                // Iniciar el Productor
+                _journalMonitor?.Start();
+
+                // --- INICIO DE CIRUGÍA 3.1: INICIAR EL CONSUMIDOR ---
+                _consumerCts?.Cancel(); // Cancelar cualquier tarea anterior
+                _consumerCts?.Dispose();
+                _consumerCts = new CancellationTokenSource();
+                _consumerTask = Task.Run(() => ConsumerLoop(_consumerCts.Token), _consumerCts.Token);
+                // --- FIN DE CIRUGÍA 3.1 ---
             }
             else
             {
-                // Si el timer existe, lo detenemos
-                _directCaptureTimer?.Stop();
-                WabiSabiLogger.Log("Timer de captura directa detenido.", LogLevel.Info);
+                // Detener ambos hilos
+                _journalMonitor?.Stop();
+                _consumerCts?.Cancel();
             }
-        }
-
-         /// <summary>
-        /// Inicia el sistema de invalidación suave de la vista
-        /// </summary>
-        private static void StartViewInvalidationSystem()
-        {
-            try
-            {
-                // Detener cualquier timer existente
-                StopViewInvalidationSystem();
-                
-                // Crear un timer de Windows Forms con intervalo más corto
-                _viewInvalidationTimer = new System.Windows.Forms.Timer
-                {
-                    Interval = 16  // 16ms = ~60 FPS
-                };
-                
-                _viewInvalidationTimer.Tick += OnInvalidationTimerTick;
-                _viewInvalidationTimer.Start();
-                
-                WabiSabiLogger.Log($"Timer de invalidación iniciado (16ms = 60 FPS)", LogLevel.Info);
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error iniciando sistema de invalidación", ex);
-            }
-        }
-
-        /// <summary>
-        /// Detiene el sistema de invalidación
-        /// </summary>
-        private static void StopViewInvalidationSystem()
-        {
-            try
-            {
-                if (_viewInvalidationTimer != null)
-                {
-                    _viewInvalidationTimer.Stop();
-                    _viewInvalidationTimer.Tick -= OnInvalidationTimerTick;
-                    _viewInvalidationTimer.Dispose();
-                    _viewInvalidationTimer = null;
-                    
-                    WabiSabiLogger.Log("Timer de invalidación detenido", LogLevel.Info);
-                }
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error deteniendo sistema de invalidación", ex);
-            }
-        }
-
-        /// <summary>
-        /// Callback del timer de invalidación
-        /// </summary>
-        private static void OnInvalidationTimerTick(object? sender, EventArgs e)
-        {
-            if (_isContinuousCaptureActive && _currentUiApp != null)
-            {
-                try
-                {
-                    // Forzar invalidación más agresiva
-                    _invalidationRequested = true;
-                    
-                    // También intentar refrescar directamente si es posible
-                    if (_currentUiApp.ActiveUIDocument?.ActiveView is View3D)
-                    {
-                        // Este es un truco para forzar redibujado
-                        _currentUiApp.ActiveUIDocument.RefreshActiveView();
-                    }
-                }
-                catch
-                {
-                    // Silenciar errores
-                }
-            }
-        }
-
+        }   
 
         /// <summary>
         /// Invalida una región mínima de la vista para forzar redibujado
@@ -1498,40 +1561,7 @@ namespace WabiSabiBridge
             }
         }
 
-       
-        /// <summary>
-        /// Detiene de forma segura el sistema de streaming y libera sus recursos.
-        /// </summary>
-        private static void ShutdownStreamingSystem()
-        {
-            try
-            {
-                WabiSabiLogger.Log("Deteniendo sistema de streaming...", LogLevel.Info);
-
-                // Detener hilo
-                _cancellationTokenSource?.Cancel();
-                _streamerThread?.Join(TimeSpan.FromSeconds(1));
-                _cancellationTokenSource?.Dispose();
-                _cancellationTokenSource = null;
-                _streamerThread = null;
-
-                // Limpiar recursos de streaming
-                _cameraAccessor?.Dispose();
-                _cameraAccessor = null;
-                _cameraMmf?.Dispose();
-                _cameraMmf = null;
-                _cameraBuffer = null; // El buffer no es IDisposable
-
-                // Desregistrar todos los servidores
-                UnregisterAllServers();
-
-                WabiSabiLogger.Log("Sistema de streaming detenido limpiamente.", LogLevel.Info);
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error durante la detención del sistema de streaming", ex);
-            }
-        }
+      
 
         private static bool CreateRibbon(UIControlledApplication application)
         {
@@ -1656,361 +1686,25 @@ namespace WabiSabiBridge
                 WabiSabiLogger.LogError("Error inicializando event handler", ex);
                 return false;
             }
-        }
+        }       
 
-        private static void InitializeStreamingSystem()
-        {
-            try
-            {
-                WabiSabiLogger.Log($"Inicializando sistema de streaming persistente...", LogLevel.Info);
-                
-                // --- CAMBIO: ELIMINAMOS LA COMPROBACIÓN DE _config.AutoExport ---
-                // El sistema se inicializa siempre.
-                
-                // Si el sistema ya está funcionando, no hacemos nada.
-                if (_cameraBuffer != null && _streamerThread != null && _streamerThread.IsAlive)
-                {
-                    WabiSabiLogger.Log("El sistema de streaming ya está activo.", LogLevel.Info);
-                    return;
-                }
-
-                // Crear buffer
-                const int BUFFER_CAPACITY = 128;
-                _cameraBuffer = new LockFreeCameraRingBuffer(BUFFER_CAPACITY);
-                WabiSabiLogger.Log($"Buffer de cámara creado con capacidad {BUFFER_CAPACITY}", LogLevel.Info);
-
-                // Crear memory-mapped file
-                if (CreateMemoryMappedFile())
-                {
-                    StartStreamerThread();
-                }
-                else
-                {
-                    WabiSabiLogger.Log("Memory-mapped file falló, el streaming no funcionará.", LogLevel.Warning);
-                }
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error inicializando sistema de streaming", ex);
-            }
-        }
-
-        private static bool CreateMemoryMappedFile()
-        {
-            try
-            {
-                // IMPORTANTE: Usar SerializableCameraData, NO CameraData
-                int cameraDataSize = System.Runtime.InteropServices.Marshal.SizeOf<SerializableCameraData>();
-                int mmfSize = ((cameraDataSize + 4095) / 4096) * 4096;
-                
-                WabiSabiLogger.Log($"Creando MMF, tamaño: {mmfSize} bytes", LogLevel.Debug);
-
-                try
-                {
-                    _cameraMmf = MemoryMappedFile.CreateNew(MmfName, mmfSize);
-                    WabiSabiLogger.Log($"MMF creado: {MmfName}", LogLevel.Info);
-                }
-                catch (IOException)
-                {
-                    // Si el nombre ya existe, crear uno único
-                    string uniqueMmfName = $"{MmfName}_{Guid.NewGuid():N}";
-                    _cameraMmf = MemoryMappedFile.CreateNew(uniqueMmfName, mmfSize);
-                    WabiSabiLogger.Log($"MMF creado con nombre único: {uniqueMmfName}", LogLevel.Info);
-                }
-                
-                _cameraAccessor = _cameraMmf.CreateViewAccessor();
-                
-                // IMPORTANTE: Escribir SerializableCameraData, NO CameraData
-                var defaultData = new SerializableCameraData
-                {
-                    EyePositionX = 0.0,
-                    EyePositionY = 0.0,
-                    EyePositionZ = 0.0,
-                    ViewDirectionX = 0.0,
-                    ViewDirectionY = 0.0,
-                    ViewDirectionZ = 1.0,
-                    UpDirectionX = 0.0,
-                    UpDirectionY = 1.0,
-                    UpDirectionZ = 0.0,
-                    SequenceNumber = 0,
-                    Timestamp = 0
-                };
-                
-                _cameraAccessor.Write(0, ref defaultData);
-                
-                WabiSabiLogger.Log("MMF inicializado correctamente", LogLevel.Info);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error creando MMF", ex);
-                
-                // Limpiar recursos en caso de error
-                _cameraAccessor?.Dispose();
-                _cameraAccessor = null;
-                _cameraMmf?.Dispose();
-                _cameraMmf = null;
-                
-                return false;
-            }
-        }
-
-        private static void StartStreamerThread()
-        {
-            try
-            {
-                _cancellationTokenSource = new CancellationTokenSource();
-                _streamerThread = new Thread(() => ProcessCameraStream(_cancellationTokenSource.Token))
-                { 
-                    IsBackground = true, 
-                    Name = "WabiSabi_CameraStreamer" 
-                };
-                _streamerThread.Start();
-                
-                WabiSabiLogger.Log("Hilo de streaming iniciado", LogLevel.Info);
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error iniciando hilo de streaming", ex);
-            }
-        }
-
-        private bool SubscribeToRevitEvents(UIControlledApplication application)
-        {
-            try
-            {
-                WabiSabiLogger.Log("Suscribiendo eventos de Revit...", LogLevel.Info);
-                
-                application.ViewActivated += OnViewActivated;
-                application.ControlledApplication.DocumentOpened += OnDocumentOpened;
-                application.ControlledApplication.DocumentClosing += OnDocumentClosing;
-                application.ControlledApplication.DocumentChanged += OnDocumentChanged;
-                application.Idling += OnIdling;
-                
-                WabiSabiLogger.Log("Eventos de Revit suscritos correctamente", LogLevel.Info);
-                return true;
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error suscribiendo eventos", ex);
-                return false;
-            }
-        }
-
-        private void OnViewActivated(object? sender, ViewActivatedEventArgs e)
-        {
-            try
-            {
-                if (!_isInitialized || e.CurrentActiveView == null) return;
-                
-                WabiSabiLogger.LogDiagnostic("ViewActivated", $"Vista: {e.CurrentActiveView.Name}, Tipo: {e.CurrentActiveView.ViewType}");
-                
-                ManageServerRegistration(e.CurrentActiveView);
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en OnViewActivated", ex);
-            }
-        }
-
-        private void OnDocumentOpened(object? sender, DocumentOpenedEventArgs e)
-        {
-            try
-            {
-                if (!_isInitialized || e.Document == null) return;
-                
-                WabiSabiLogger.LogDiagnostic("DocumentOpened", $"Documento: {e.Document.Title}");
-                
-                var uidoc = new UIDocument(e.Document);
-                if (uidoc.ActiveView != null)
-                {
-                    ManageServerRegistration(uidoc.ActiveView);
-                }
-                
-                GeometryCacheManager.Instance.InvalidateCache();
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en OnDocumentOpened", ex);
-            }
-        }
-
-        private void OnDocumentClosing(object? sender, DocumentClosingEventArgs e)
-        {
-            try
-            {
-                if (!_isInitialized || e.Document == null) return;
-                
-                WabiSabiLogger.LogDiagnostic("DocumentClosing", $"Documento: {e.Document.Title}");
-                
-                if (_documentServers.TryGetValue(e.Document, out var serverToClose))
-                {
-                    UnregisterServer(serverToClose);
-                    if (_currentServer == serverToClose) 
-                    {
-                        _currentServer = null;
-                    }
-                    _documentServers.Remove(e.Document);
-                }
-                
-                GeometryCacheManager.Instance.InvalidateCache();
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en OnDocumentClosing", ex);
-            }
-        }
         
-        private void OnDocumentChanged(object? sender, DocumentChangedEventArgs e)
-        {
-            try
-            {
-                if (!_isInitialized) return;
-                
-                Document doc = e.GetDocument();
-                if (doc != null)
-                {
-                    int addedCount = e.GetAddedElementIds().Count;
-                    int deletedCount = e.GetDeletedElementIds().Count;
-                    int modifiedCount = e.GetModifiedElementIds().Count;
-                    
-                    if (addedCount > 0 || deletedCount > 0 || modifiedCount > 0)
-                    {
-                        WabiSabiLogger.LogDiagnostic("DocumentChanged", 
-                            $"Añadidos: {addedCount}, Eliminados: {deletedCount}, Modificados: {modifiedCount}");
-                        
-                        GeometryCacheManager.Instance.InvalidateCache();
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en OnDocumentChanged", ex);
-            }
-        }
-
-        private static void CaptureCameraDataDirectly(UIDocument? uiDoc)
-        {
-            if (uiDoc?.Document == null || uiDoc.ActiveView is not View3D view3D || _cameraBuffer == null)
-            {
-                return;
-            }
-
-            try
-            {
-                var orientation = view3D.GetOrientation();
-
-                // Solo escribimos data nueva si la cámara realmente se movió
-                // La función HasOrientationChanged ya existe en la clase
-                if (HasOrientationChanged(orientation))
-                {
-                    // Creamos una copia de la orientación para la siguiente comparación
-                    _lastKnownOrientation = new ViewOrientation3D(orientation.EyePosition, orientation.UpDirection, orientation.ForwardDirection);
-                    
-                    // Creamos los datos de la cámara con un número de secuencia que SÍ se incrementa
-                    var cameraData = new CameraData
-                    {
-                        EyePosition = orientation.EyePosition,
-                        ViewDirection = orientation.ForwardDirection,
-                        UpDirection = orientation.UpDirection,
-                        // Usamos el secuenciador del hilo de streaming para mantener la consistencia
-                        SequenceNumber = Interlocked.Increment(ref WabiSabiBridgeApp._globalSequenceNumber),
-                        Timestamp = Stopwatch.GetTimestamp()
-                    };
-
-                    // Escribimos en el buffer. El otro hilo se encargará de pasarlo al MMF.
-                    _cameraBuffer.TryWrite(cameraData);
-                }
-            }
-            catch (Autodesk.Revit.Exceptions.InvalidOperationException)
-            {
-                // Ignorar errores que ocurren si la vista no está completamente lista
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogDiagnostic("CaptureCamera", $"Error en captura directa: {ex.Message}");
-            }
-        }
-
-        // WabiSabiBridge.cs -> WabiSabiBridgeApp
         private void OnIdling(object? sender, IdlingEventArgs e)
         {
-            // Si la captura continua no está activa, no hacemos nada en Idling.
-            if (!_isInitialized || !_isContinuousCaptureActive) return;
-
-            // El único trabajo de Idling es procesar los datos que el Timer ha generado.
-            if (_cameraAccessor != null && _cameraAccessor.CanRead)
-            {
-                ProcessAutoExportLogicContinuous();
-            }
+           
         }
 
 
         /// <summary>
-        /// Versión mejorada de la lógica de auto-export para captura continua
+        /// --- MÉTODO DE PROCESAMIENTO INTELIGENTE ---
         /// </summary>
-        private static void ProcessAutoExportLogicContinuous()
+        
+        private static void RequestFrameExport()
         {
-            try
-            {
-                // 1. LEER DATOS
-                _cameraAccessor!.Read(0, out SerializableCameraData serializableData);
-                CameraData data = serializableData.ToCameraData();
-
-                // Si no estamos en modo continuo o no hay datos, no hacer nada.
-                if (!_isContinuousCaptureActive || data.SequenceNumber < 0) return;
-                
-                WabiSabiLogger.LogDiagnostic("AutoExport", 
-                    $"Leyendo datos - Seq Leída: {data.SequenceNumber}, Última Procesada: {_lastProcessedSequenceNumber}");
-
-                // 2. DETECTAR MOVIMIENTO
-                // La cámara se está moviendo si el número de secuencia que leemos es MAYOR
-                // que el último que procesamos en la ejecución anterior.
-                bool isMoving = data.SequenceNumber > _lastProcessedSequenceNumber;
-
-                if (isMoving)
-                {
-                    // Si hay movimiento, simplemente actualizamos el timestamp para saber
-                    // que la cámara estuvo activa recientemente.
-                    _lastCameraMoveTimestamp = Stopwatch.GetTimestamp();
-                    WabiSabiLogger.Log($"Movimiento de cámara detectado! Seq: {data.SequenceNumber}", LogLevel.Info);
-                }
-                else if (_lastCameraMoveTimestamp > 0)
-                {
-                    // 3. GESTIONAR ESTABILIDAD
-                    // Si no hay movimiento (isMoving = false), y tenemos un timestamp de movimiento previo,
-                    // significa que el usuario acaba de detenerse. Comprobamos cuánto tiempo ha pasado.
-                    long now = Stopwatch.GetTimestamp();
-                    long timeSinceMove = (now - _lastCameraMoveTimestamp) / TimeSpan.TicksPerMillisecond;
-                    long timeSinceExport = (now - _lastExportTimestamp) / TimeSpan.TicksPerMillisecond;
-
-                    WabiSabiLogger.LogDiagnostic("AutoExport", 
-                        $"Verificando estabilidad - Tiempo desde último mov: {timeSinceMove}ms");
-
-                    // Si han pasado más de 500ms de estabilidad y no hemos exportado en el último segundo...
-                    if (timeSinceMove > 500 && timeSinceExport > 1000)
-                    {
-                        WabiSabiLogger.Log($"Exportando después de {timeSinceMove}ms de estabilidad", LogLevel.Info);
-                        
-                        TriggerAutoExport();
-                        
-                        // Reiniciamos los timestamps para evitar exportaciones múltiples.
-                        //_lastCameraMoveTimestamp = 0;
-                        _lastExportTimestamp = now;
-                    }
-                }
-
-                // 4. ACTUALIZAR ESTADO
-                // Al final de todo, actualizamos el número del último paquete que hemos procesado.
-                _lastProcessedSequenceNumber = data.SequenceNumber;
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en ProcessAutoExportLogicContinuous", ex);
-                // Reiniciar estado en caso de error
-                _lastCameraMoveTimestamp = 0;
-                _lastProcessedSequenceNumber = -1;
-            }
+            // Este método es llamado por OnIdling a 12 FPS.
+            // Su único trabajo es levantar el evento externo que
+            // disparará la exportación en un contexto 100% seguro.
+            WabiSabiEvent?.Raise();
         }
 
         private static bool HasOrientationChanged(ViewOrientation3D newOrientation)
@@ -2031,11 +1725,18 @@ namespace WabiSabiBridge
         {
             try
             {
+                // --- INICIO DE CIRUGÍA 1: FORZAR LA RECARGA DE CONFIGURACIÓN ---
+                
+                // Recargamos la configuración desde el disco cada vez.
+                // Esto asegura que cualquier cambio en la UI (resolución, calidad, etc.)
+                // se aplique a la siguiente exportación automática.
                 var currentConfig = WabiSabiConfig.Load();
+
                 if (WabiSabiEventHandler != null && !string.IsNullOrWhiteSpace(currentConfig.OutputPath))
                 {
-                    WabiSabiLogger.Log("Configurando parámetros para auto-export", LogLevel.Debug);
+                    WabiSabiLogger.Log("Configurando parámetros para auto-export...", LogLevel.Debug);
                     
+                    // Asignamos TODOS los parámetros desde la configuración cargada al handler.
                     WabiSabiEventHandler.OutputPath = currentConfig.OutputPath;
                     WabiSabiEventHandler.ExportDepth = currentConfig.ExportDepth;
                     WabiSabiEventHandler.DepthResolution = currentConfig.DepthResolution;
@@ -2047,13 +1748,15 @@ namespace WabiSabiBridge
                     WabiSabiEventHandler.SaveTimestampedRender = currentConfig.SaveTimestampedRender;
                     WabiSabiEventHandler.SaveTimestampedDepth = currentConfig.SaveTimestampedDepth;
                     
+                    // La llamada a Raise() ahora usará la configuración más actualizada.
                     WabiSabiEvent?.Raise();
-                    WabiSabiLogger.Log("Auto-export disparado exitosamente", LogLevel.Info);
+                    WabiSabiLogger.Log("Auto-export disparado exitosamente.", LogLevel.Info);
                 }
                 else
                 {
-                    WabiSabiLogger.LogError("No se puede disparar auto-export: Handler o OutputPath inválidos");
+                    WabiSabiLogger.LogError("No se puede disparar auto-export: Handler o OutputPath inválidos.");
                 }
+                // --- FIN DE CIRUGÍA 1 ---
             }
             catch (Exception ex)
             {
@@ -2061,297 +1764,25 @@ namespace WabiSabiBridge
             }
         }
 
-        private static void ProcessAutoExportLogic()
-        {
-            try
-            {
-                // 1. CONSUMIR: Leemos el último dato que el PRODUCTOR (servidor en tiempo real) ha generado.
-                _cameraAccessor!.Read(0, out SerializableCameraData serializableData);
-                CameraData data = serializableData.ToCameraData();
-                
-                // 2. DETECTAR MOVIMIENTO: Si el número de secuencia ha aumentado, significa que
-                //    el servidor estuvo activo (el usuario estuvo moviendo la cámara).
-                if (data.SequenceNumber > _lastKnownSequenceNumber)
-                {
-                    // Hemos detectado que hubo movimiento desde la última vez que Idling se ejecutó.
-                    WabiSabiLogger.LogDiagnostic("AutoExport", 
-                        $"Movimiento de cámara detectado por el servidor. Seq: {data.SequenceNumber} > {_lastKnownSequenceNumber}");
-                    
-                    // Actualizamos el último número de secuencia que hemos visto y la hora de este "check-in".
-                    _lastKnownSequenceNumber = data.SequenceNumber;
-                    _lastCameraMoveTimestamp = Stopwatch.GetTimestamp();
-                }
-                else
-                {
-                    // 3. GESTIONAR ESTABILIDAD: Si el número de secuencia NO ha aumentado,
-                    //    significa que el usuario ha dejado de mover la cámara.
-                    //    Ahora comprobamos si ha pasado suficiente tiempo desde el último movimiento detectado.
-                    if (_lastCameraMoveTimestamp > 0)
-                    {
-                        long now = Stopwatch.GetTimestamp();
-                        long timeSinceMove = (now - _lastCameraMoveTimestamp) / TimeSpan.TicksPerMillisecond;
-                        long timeSinceExport = (now - _lastExportTimestamp) / TimeSpan.TicksPerMillisecond;
-                        
-                        // Si han pasado 500ms desde el último check-in donde detectamos movimiento...
-                        if (timeSinceMove > 500 && timeSinceExport > 100)
-                        {
-                            WabiSabiLogger.Log($"Disparando auto-export después de {timeSinceMove}ms de estabilidad", LogLevel.Info);
-                            
-                            // Disparamos la exportación.
-                            TriggerAutoExport();
-                            
-                            // Reiniciamos el timestamp del movimiento. El sistema ahora esperará
-                            // a que `data.SequenceNumber` vuelva a ser mayor que el actual.
-                            _lastCameraMoveTimestamp = 0;
-                            _lastExportTimestamp = now;
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en ProcessAutoExportLogic", ex);
-                _lastCameraMoveTimestamp = 0;
-            }
-        }
-
-        private static void ManageServerRegistration(Autodesk.Revit.DB.View view)
-        {
-            try
-            {
-                if (view?.Document == null) return;
-                
-                var doc = view.Document;
-                
-                WabiSabiLogger.LogDiagnostic("ServerRegistration", 
-                    $"Gestionando servidor para doc: {doc.Title}, Vista: {view.Name}");
-
-                // --- CAMBIO: LA LÓGICA DE REGISTRO YA NO DEPENDE DE _config.AutoExport ---
-                // Si la vista es 3D, nos aseguramos de que haya un servidor registrado.
-                if (view.ViewType == ViewType.ThreeD)
-                {
-                    if (_documentServers.TryGetValue(doc, out var existingServer))
-                    {
-                        _currentServer = existingServer;
-                        WabiSabiLogger.LogDiagnostic("ServerRegistration", "Servidor existente encontrado y asignado como actual.");
-                    }
-                    else
-                    {
-                        // No hay servidor para este documento, lo registramos.
-                        WabiSabiLogger.LogDiagnostic("ServerRegistration", "No existe servidor, procediendo a registrar uno nuevo.");
-                        RegisterServerForDocument(doc);
-                    }
-                }
-                else
-                {
-                    WabiSabiLogger.LogDiagnostic("ServerRegistration", 
-                        $"No se registra servidor porque la vista '{view.Name}' no es 3D.");
-                }
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en ManageServerRegistration", ex);
-            }
-        }
-
-       private static void RegisterServerForDocument(Document doc)
-        {
-            try
-            {
-                if (doc == null || !doc.IsValidObject)
-                {
-                    WabiSabiLogger.LogError("No se puede registrar servidor: documento nulo o inválido");
-                    return;
-                }
-
-                if (_cameraBuffer == null)
-                {
-                    WabiSabiLogger.LogError("No se puede registrar servidor sin buffer de cámara");
-                    return;
-                }
-
-                if (_documentServers.ContainsKey(doc))
-                {
-                    WabiSabiLogger.LogDiagnostic("ServerRegistration", $"Ya existe un servidor para '{doc.Title}'.");
-                    _currentServer = _documentServers[doc];
-                    // La lógica de activación se gestiona externamente, así que solo salimos.
-                    return;
-                }
-
-                // CAMBIO CLAVE: Obtener el servicio y hacer el CAST al tipo CORRECTO.
-                var multiServerService = ExternalServiceRegistry.GetService(
-                    ExternalServices.BuiltInExternalServices.DirectContext3DService) as MultiServerService;
-                    
-                if (multiServerService == null)
-                {
-                    WabiSabiLogger.LogError("Servicio DirectContext3D (MultiServerService) no disponible.");
-                    return;
-                }
-
-                var server = new CameraDataExtractionServer(_cameraBuffer);
-                
-                if (_config.AutoExport)
-                {
-                    server.ContinuousCapture = true;
-                    _isContinuousCaptureActive = true;
-                }
-                
-                try
-                {
-                    // Ahora usamos la variable `multiServerService` que SÍ tiene estos métodos.
-                    multiServerService.AddServer(server);
-                    
-                    _documentServers[doc] = server;
-                    _currentServer = server;
-                    _lastKnownSequenceNumber = -1;
-
-                    WabiSabiLogger.Log($"Servidor registrado exitosamente para documento: {doc.Title}", LogLevel.Info);
-                    
-                    // La llamada a ActivateServerForAllViews ahora funcionará porque le pasamos un objeto válido.
-                    ActivateServerForAllViews(doc);
-                    
-                    if (_config.AutoExport && _viewInvalidationTimer == null)
-                    {
-                        StartViewInvalidationSystem();
-                    }
-                }
-                catch (Exception ex)
-                {
-                    WabiSabiLogger.LogDiagnostic("ServerRegistration", $"Error registrando servidor: {ex.Message}");
-                }
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError($"Error registrando servidor para '{doc?.Title ?? "documento desconocido"}'", ex);
-            }
-        }
-
-        /// <summary>
-        /// NUEVO MÉTODO: Activa el servidor como servidor activo para todas las vistas 3D
-        /// </summary>
-        private static void ActivateServerForAllViews(Document doc)
-        {
-            try
-            {
-                if (_currentServer == null || doc == null) return;
-
-                var multiServerService = ExternalServiceRegistry.GetService(
-                    ExternalServices.BuiltInExternalServices.DirectContext3DService) as MultiServerService;
-                    
-                if (multiServerService == null)
-                {
-                    WabiSabiLogger.LogError("No se pudo obtener MultiServerService para activación");
-                    return;
-                }
-
-                // Se obtiene la lista actual de servidores activos para el documento para no sobrescribir otros.
-                var activeServers = multiServerService.GetActiveServerIds(doc);
-
-                // Se añade nuestro servidor a la lista si no está ya.
-                if (!activeServers.Contains(_currentServer.GetServerId()))
-                {
-                    activeServers.Add(_currentServer.GetServerId());
-                }
-                
-                // CAMBIO CRÍTICO: Se llama UNA SOLA VEZ a nivel de documento y con los parámetros en el orden correcto.
-                // SetActiveServers(IList<Guid> serverIds, Document document)
-                multiServerService.SetActiveServers(activeServers, doc);
-                
-                WabiSabiLogger.Log($"Servidor {_currentServer.GetServerId()} activado para el documento {doc.Title}", LogLevel.Info);
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en ActivateServerForAllViews", ex);
-            }
-        }
         
-        // Método adicional para manejar el registro diferido
-        private static void ScheduleServerRegistration(Document doc)
-        {
-            try
-            {
-                if (doc == null || _documentServers.ContainsKey(doc))
-                {
-                    return;
-                }
-
-                // Marcar el documento para registro diferido
-                WabiSabiLogger.LogDiagnostic("ServerRegistration", 
-                    $"Programando registro diferido para '{doc.Title}'");
-                
-                // El registro real se hará en el siguiente evento Idling cuando tengamos un contexto válido
-                _pendingRegistrations.Add(doc);
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error programando registro diferido", ex);
-            }
-        }        
-  
-        
-        private static void UnregisterAllServers()
-        {
-            try
-            {
-                foreach (var server in _documentServers.Values) 
-                {
-                    UnregisterServer(server);
-                }
-                _documentServers.Clear();
-                _currentServer = null;
-                
-                WabiSabiLogger.Log("Todos los servidores desregistrados", LogLevel.Info);
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error desregistrando todos los servidores", ex);
-            }
-        }
-
-        private static void UnregisterServer(CameraDataExtractionServer server)
-        {
-            try
-            {
-                // CAMBIO CLAVE: Obtener el servicio y hacer el CAST al tipo CORRECTO.
-                var multiServerService = ExternalServiceRegistry.GetService(
-                    ExternalServices.BuiltInExternalServices.DirectContext3DService) as MultiServerService;
-
-                // Ahora el objeto no será nulo y SÍ tiene el método RemoveServer.
-                multiServerService?.RemoveServer(server.GetServerId());
-                
-                WabiSabiLogger.Log($"Servidor desregistrado: {server.GetServerId()}", LogLevel.Info);
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error desregistrando servidor", ex);
-            }
-        }
 
         public Result OnShutdown(UIControlledApplication application)
         {
             try
             {
                 WabiSabiLogger.Log("WabiSabi Bridge - CERRANDO", LogLevel.Info);
-                // DETENER EL HILO CONSUMIDOR
-                _exportCts?.Cancel();
-                _exportWorker?.Wait(TimeSpan.FromSeconds(2)); // Esperar a que termine
-                _exportCts?.Dispose();
-                WabiSabiLogger.Log("Hilo de trabajo de exportación detenido.", LogLevel.Info);
-                // Detener nuestro nuevo timer
-                if (_directCaptureTimer != null)
-                {
-                    _directCaptureTimer.Stop();
-                    _directCaptureTimer.Dispose();
-                    _directCaptureTimer = null;
-                }
+                _journalMonitor?.Stop();
+                // Detener el hilo metrónomo de sondeo de cámara
+                ;
                 
-                // ... (el resto del código de OnShutdown se queda igual)
-                StopViewInvalidationSystem();
-                ShutdownStreamingSystem();
-                CleanupNonStreamingResources();
+                // Detener el hilo consumidor de exportaciones
+                _exportCts?.Cancel();
+                _exportWorker?.Wait(TimeSpan.FromSeconds(2));
+                
+                // Liberar recursos de los handlers
+                WabiSabiEventHandler?.Dispose();
                 
                 WabiSabiLogger.Log("WabiSabi Bridge cerrado correctamente", LogLevel.Info);
-                
                 return Result.Succeeded;
             }
             catch (Exception ex)
@@ -2380,60 +1811,7 @@ namespace WabiSabiBridge
             }
         }
 
-        private static void ProcessCameraStream(CancellationToken token)
-        {
-            WabiSabiLogger.Log("Hilo de streaming de cámara iniciado", LogLevel.Info);
-            int processedFrames = 0;
-            
-            while (!token.IsCancellationRequested)
-            {
-                try
-                {
-                    bool hasData = false;
-                    
-                    if (_cameraBuffer != null && _cameraAccessor != null && _cameraAccessor.CanWrite)
-                    {
-                        if (_cameraBuffer.TryRead(out CameraData data))
-                        {
-                            // IMPORTANTE: Verificar el tamaño antes de escribir
-                            int requiredSize = System.Runtime.InteropServices.Marshal.SizeOf<SerializableCameraData>();
-                            if (_cameraAccessor.Capacity >= requiredSize)
-                            {
-                                // Convertir CameraData a SerializableCameraData
-                                var serializableData = SerializableCameraData.FromCameraData(data);
-                                
-                                // Escribir la estructura serializable
-                                _cameraAccessor.Write(0, ref serializableData);
-                                processedFrames++;
-                                hasData = true;
-                                
-                                if (processedFrames % 100 == 0)
-                                {
-                                    WabiSabiLogger.LogDiagnostic("CameraStream", 
-                                        $"{processedFrames} frames procesados");
-                                }
-                            }
-                            else
-                            {
-                                WabiSabiLogger.LogError($"MMF muy pequeño. Requerido: {requiredSize}, Disponible: {_cameraAccessor.Capacity}");
-                            }
-                        }
-                    }
-                    
-                    if (!hasData)
-                    {
-                        Thread.Sleep(1);
-                    }
-                }
-                catch (Exception ex)
-                {
-                    WabiSabiLogger.LogError("Error en hilo de streaming", ex);
-                    Thread.Sleep(100);
-                }
-            }
-            
-            WabiSabiLogger.Log($"Hilo de streaming terminado. Total frames procesados: {processedFrames}", LogLevel.Info);
-        }
+       
 
         internal static string RunDiagnostics()
         {
@@ -2441,29 +1819,25 @@ namespace WabiSabiBridge
             
             diag.AppendLine($"Estado del sistema WabiSabi:");
             diag.AppendLine($"- Inicializado: {_isInitialized}");
-            diag.AppendLine($"- EventHandler: {(WabiSabiEventHandler != null ? "OK" : "NULL")}");
-            diag.AppendLine($"- Event: {(WabiSabiEvent != null ? "OK" : "NULL")}");
+            diag.AppendLine($"- EventHandler (Export): {(WabiSabiEventHandler != null ? "OK" : "NULL")}");
+            diag.AppendLine($"- Event (Export): {(WabiSabiEvent != null ? "OK" : "NULL")}");
+            
+            diag.AppendLine("\n--- Sistema de Sondeo de Cámara ---");
+            
+            
+            
             diag.AppendLine($"- CameraBuffer: {(_cameraBuffer != null ? "OK" : "NULL")}");
-            diag.AppendLine($"- MMF: {(_cameraMmf != null ? "OK" : "NULL")}");
-            diag.AppendLine($"- Accessor: {(_cameraAccessor != null ? "OK" : "NULL")}");
-            diag.AppendLine($"- CurrentServer: {(_currentServer != null ? "OK" : "NULL")}");
             
-            // Agregar estadísticas del servidor si está disponible
-            if (_currentServer != null)
-            {
-                var stats = _currentServer.GetServerStats();
-                diag.AppendLine($"- Server Stats: {stats}");
-            }
-            
-            diag.AppendLine($"- StreamerThread: {(_streamerThread != null && _streamerThread.IsAlive ? "VIVO" : "INACTIVO")}");
-            diag.AppendLine($"- Servidores registrados: {_documentServers.Count}");
+            diag.AppendLine("\n--- Estado de Auto-Export ---");
             diag.AppendLine($"- Config.AutoExport: {_config.AutoExport}");
-            diag.AppendLine($"- Config.OutputPath: {_config.OutputPath}");
-            diag.AppendLine($"- Idling calls: {_idlingCallCount}");
-            diag.AppendLine($"- Last sequence: {_lastKnownSequenceNumber}");
-            diag.AppendLine($"- Captura continua activa: {_isContinuousCaptureActive}");
-            diag.AppendLine($"- Timer invalidación: {(_viewInvalidationTimer != null && _viewInvalidationTimer.Enabled ? "ACTIVO" : "INACTIVO")}");
-            
+            diag.AppendLine($"- Captura continua activa (flag): {_isContinuousCaptureActive}");
+            diag.AppendLine($"- Último Seq. Global: {_globalSequenceNumber}");
+            diag.AppendLine($"- Último Seq. Procesada: {_lastProcessedSequenceNumber}");
+
+            diag.AppendLine("\n--- Sistema de Cola de Exportación ---");
+            diag.AppendLine($"- Tarea de Exportación (Worker): {(_exportWorker != null && !_exportWorker.IsCompleted ? "Corriendo" : "Detenida")}");
+            diag.AppendLine($"- Trabajos en cola: {_exportQueue.Count}");
+
             string result = diag.ToString();
             WabiSabiLogger.Log("=== DIAGNÓSTICO ===\n" + result, LogLevel.Info);
             
