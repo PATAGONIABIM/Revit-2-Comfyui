@@ -8,6 +8,7 @@ using System.Drawing.Imaging;
 using System.Diagnostics;
 using Newtonsoft.Json;
 using System.Drawing;
+using WabiSabiBridge.UI;
 
 // Revit API
 using Autodesk.Revit.Attributes;
@@ -37,6 +38,7 @@ using System.IO.MemoryMappedFiles;
 using System.Runtime.CompilerServices;
 using TaskDialog = Autodesk.Revit.UI.TaskDialog;
 using System.Collections.Concurrent;
+using System.Text.RegularExpressions;
 // --- FIN DE NUEVOS USINGS ---
 
 namespace WabiSabiBridge
@@ -156,10 +158,9 @@ namespace WabiSabiBridge
 
         private DepthExtractor? _depthExtractor = null;
         private DepthExtractorFast? _depthExtractorFast = null;
-        // CAMBIO: El tipo de campo se cambia a la clase concreta para mejorar el rendimiento al evitar la indirección de la interfaz.
         private GpuAccelerationManager? _gpuManager;
         
-        public void Execute(UIApplication app)
+        public async void Execute(UIApplication app)
         {
             try
             {
@@ -180,7 +181,7 @@ namespace WabiSabiBridge
                 double trueAspectRatio = isCropActive
                     ? ((outline.Max.V - outline.Min.V) > 1e-9 ? (outline.Max.U - outline.Min.U) / (outline.Max.V - outline.Min.V) : 1.0)
                     : (double)(uiView.GetWindowRectangle().Right - uiView.GetWindowRectangle().Left) / (uiView.GetWindowRectangle().Bottom - uiView.GetWindowRectangle().Top);
-                
+
                 int targetWidth = this.DepthResolution;
                 int targetHeight = (int)(Math.Round((targetWidth / trueAspectRatio) / 2.0) * 2.0);
 
@@ -200,6 +201,8 @@ namespace WabiSabiBridge
 
                 // --- TAREA 3: CALCULAR DATOS DE PROFUNDIDAD Y/O LÍNEAS (en el hilo de Revit) ---
                 double[,]? depthData = null;
+                // NOTA PARA SOLUCIONAR EL ERROR: El error 'Object reference...' se debe a que el control _depthRangeTrackBar
+                // no está inicializado en la clase WabiSabiBridgeWindow. Debe añadir su creación en el método InitializeComponent.
                 if (this.ExportDepth)
                 {
                     UpdateStatusCallback?.Invoke("Calculando profundidad/líneas...", System.Drawing.Color.Blue);
@@ -209,102 +212,129 @@ namespace WabiSabiBridge
                         _gpuManager ??= new GpuAccelerationManager(null);
 
                         bool useFallbackMode = false;
-                        
-                        // Modo "Alta": es el modo inteligente que usa la GPU para líneas si puede.
-                        if (DepthQuality == 2) // Calidad "Alta (Geometría/GPU)"
+
+                        // --- INICIO DE ACTUALIZACIÓN: Integración de ModernProgressDialog ---
+                        if (DepthQuality == 2 && UseGpuAcceleration && _gpuManager?.IsGpuAvailable == true) // Calidad "Alta (Geometría/GPU)"
                         {
-                            // Si tenemos GPU, usamos el renderizado de líneas.
-                            if (UseGpuAcceleration && _gpuManager?.IsGpuAvailable == true)
+                            (double[,]? GpuDepthData, bool RenderedOnGpu) result = (null, false);
+                            using (var progressDialog = new ModernProgressDialog("Procesando Geometría (GPU)"))
                             {
-                                var cacheManager = GeometryCacheManager.Instance;
-                                var cachedData = cacheManager.EnsureCacheIsValid(doc, view3D, UpdateStatusCallback);
-
-                                if (cacheManager.IsCacheValid && cachedData.TriangleCount > 0)
+                                try
                                 {
-                                    var eyePosition = view3D.GetOrientation().EyePosition;
-                                    XYZ bottomLeft = viewCorners[0];
-                                    XYZ topRight = viewCorners[1];
-                                    var upDir = orientation.UpDirection.Normalize();
-                                    var rightDir = orientation.ForwardDirection.CrossProduct(upDir).Normalize();
-                                    XYZ viewWidthVec = (topRight - bottomLeft).DotProduct(rightDir) * rightDir;
-                                    XYZ viewHeightVec = (topRight - bottomLeft).DotProduct(upDir) * upDir;
-                                    double minDepth = 0.1;
-                                    double maxDepth = AutoDepthRange ? 
-                                        (view3D.CropBox.Enabled ? (view3D.CropBox.Max - view3D.CropBox.Min).GetLength() * 1.2 : 100.0) 
-                                        : DepthRangeDistance;
-
-                                    var config = new RayTracingConfig
+                                    result = await progressDialog.RunAsync(async (progress, cancellationToken) =>
                                     {
-                                        EyePosition = new ComputeSharp.Float3((float)eyePosition.X, (float)eyePosition.Y, (float)eyePosition.Z),
-                                        ViewDirection = new ComputeSharp.Float3((float)(bottomLeft.X - eyePosition.X), (float)(bottomLeft.Y - eyePosition.Y), (float)(bottomLeft.Z - eyePosition.Z)),
-                                        RightDirection = new ComputeSharp.Float3((float)viewWidthVec.X, (float)viewWidthVec.Y, (float)viewWidthVec.Z),
-                                        UpDirection = new ComputeSharp.Float3((float)viewHeightVec.X, (float)viewHeightVec.Y, (float)viewHeightVec.Z),
-                                        Width = targetWidth, 
-                                        Height = targetHeight, 
-                                        MinDepth = (float)minDepth, 
-                                        MaxDepth = (float)maxDepth
-                                    };
-
-                                    // GENERAR LÍNEAS con GPU
-                                    UpdateStatusCallback?.Invoke("Renderizando líneas (GPU)...", System.Drawing.Color.Green);
-                                    var lineTask = Task.Run(async () => await _gpuManager.ExecuteLineRenderAsync(
-                                        cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config));
-                                    float[] gpuLineBuffer = lineTask.Result;
-                                    
-                                    // Guardar líneas directamente
-                                    GenerateImageFromGpuBuffer(gpuLineBuffer, targetWidth, targetHeight, this.OutputPath, timestamp);
-                                    
-                                    // TAMBIÉN GENERAR DEPTH con GPU
-                                    UpdateStatusCallback?.Invoke("Calculando profundidad (GPU)...", System.Drawing.Color.Blue);
-                                    var depthTask = Task.Run(async () => await _gpuManager.ExecuteDepthRayTracingFromCacheAsync(
-                                        cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config));
-                                    float[] gpuDepthBuffer = depthTask.Result;
-                                    
-                                    // Convertir float[] a double[,]
-                                    depthData = new double[targetHeight, targetWidth];
-                                    Parallel.For(0, targetHeight, y =>
-                                    {
-                                        for (int x = 0; x < targetWidth; x++)
+                                        // --- Etapa 1: Caché de geometría (0% -> 50%) ---
+                                        var cacheManager = GeometryCacheManager.Instance;
+                                        Action<string, System.Drawing.Color> progressCallback = (msg, color) =>
                                         {
-                                            int idx = y * targetWidth + x;
-                                            depthData[y, x] = gpuDepthBuffer[idx];
+                                            int percent = 0;
+                                            if (System.Text.RegularExpressions.Regex.Match(msg, @"(\d+)%") is var match && match.Success)
+                                            {
+                                                percent = int.Parse(match.Groups[1].Value);
+                                            }
+                                            // Escalar el progreso a la primera mitad de la barra
+                                            progress.Report((percent / 2, msg));
+                                        };
+
+                                        var cachedData = await Task.Run(() => cacheManager.EnsureCacheIsValid(doc, view3D, progressCallback), cancellationToken);
+                                        cancellationToken.ThrowIfCancellationRequested();
+
+                                        if (!cacheManager.IsCacheValid || cachedData.TriangleCount == 0)
+                                        {
+                                            throw new InvalidOperationException("No se pudo generar un caché de geometría válido.");
                                         }
+
+                                        // Configuración para el renderizado
+                                        var eyePosition = view3D.GetOrientation().EyePosition;
+                                        XYZ bottomLeft = viewCorners[0];
+                                        XYZ topRight = viewCorners[1];
+                                        var upDir = orientation.UpDirection.Normalize();
+                                        var rightDir = orientation.ForwardDirection.CrossProduct(upDir).Normalize();
+                                        XYZ viewWidthVec = (topRight - bottomLeft).DotProduct(rightDir) * rightDir;
+                                        XYZ viewHeightVec = (topRight - bottomLeft).DotProduct(upDir) * upDir;
+                                        double minDepth = 0.1;
+                                        double maxDepth = AutoDepthRange ? 
+                                            (view3D.CropBox.Enabled ? (view3D.CropBox.Max - view3D.CropBox.Min).GetLength() * 1.2 : 100.0) 
+                                            : DepthRangeDistance;
+
+                                        var config = new RayTracingConfig
+                                        {
+                                            EyePosition = new ComputeSharp.Float3((float)eyePosition.X, (float)eyePosition.Y, (float)eyePosition.Z),
+                                            ViewDirection = new ComputeSharp.Float3((float)(bottomLeft.X - eyePosition.X), (float)(bottomLeft.Y - eyePosition.Y), (float)(bottomLeft.Z - eyePosition.Z)),
+                                            RightDirection = new ComputeSharp.Float3((float)viewWidthVec.X, (float)viewWidthVec.Y, (float)viewWidthVec.Z),
+                                            UpDirection = new ComputeSharp.Float3((float)viewHeightVec.X, (float)viewHeightVec.Y, (float)viewHeightVec.Z),
+                                            Width = targetWidth, Height = targetHeight, MinDepth = (float)minDepth, MaxDepth = (float)maxDepth
+                                        };
+
+                                        // --- Etapa 2: Renderizado de líneas (50% -> 75%) ---
+                                        progress.Report((50, "Renderizando líneas con GPU..."));
+                                        float[] gpuLineBuffer = await _gpuManager.ExecuteLineRenderAsync(cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config);
+                                        cancellationToken.ThrowIfCancellationRequested();
+                                        GenerateImageFromGpuBuffer(gpuLineBuffer, targetWidth, targetHeight, this.OutputPath, timestamp);
+                                        
+                                        // --- Etapa 3: Renderizado de profundidad (75% -> 95%) ---
+                                        progress.Report((75, "Calculando profundidad con GPU..."));
+                                        float[] gpuDepthBuffer = await _gpuManager.ExecuteDepthRayTracingFromCacheAsync(cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config);
+                                        cancellationToken.ThrowIfCancellationRequested();
+                                        
+                                        // --- Etapa 4: Conversión de datos (95% -> 100%) ---
+                                        progress.Report((95, "Finalizando..."));
+                                        var finalDepthData = new double[targetHeight, targetWidth];
+                                        Parallel.For(0, targetHeight, y =>
+                                        {
+                                            for (int x = 0; x < targetWidth; x++)
+                                            {
+                                                int idx = y * targetWidth + x;
+                                                finalDepthData[y, x] = gpuDepthBuffer[idx];
+                                            }
+                                        });
+                                        
+                                        progress.Report((100, "¡Completado!"));
+                                        await Task.Delay(500, cancellationToken); // Pausa para ver el mensaje final
+
+                                        return (finalDepthData, true);
                                     });
-                                    
-                                    // No exportar la imagen de Revit ya que usamos GPU directamente
-                                    tempRenderPath = "";
+
+                                    // Asignar resultados después de que el diálogo se complete
+                                    depthData = result.GpuDepthData;
+                                    if (result.RenderedOnGpu)
+                                    {
+                                        // La imagen de render ya fue generada por la GPU, no necesitamos el temporal.
+                                        tempRenderPath = "";
+                                    }
                                 }
-                                else
+                                catch (OperationCanceledException)
                                 {
-                                    UpdateStatusCallback?.Invoke("Caché no válido, usando modo Normal.", System.Drawing.Color.Orange);
-                                    useFallbackMode = true;
+                                    UpdateStatusCallback?.Invoke("Operación cancelada.", Drawing.Color.Orange);
+                                    WabiSabiLogger.Log("Exportación GPU cancelada por el usuario.", LogLevel.Info);
+                                    return; // Salir del método Execute
                                 }
-                            }
-                            else // Si no hay GPU, usamos el fallback de extracción de geometría (CPU)
-                            {
-                                UpdateStatusCallback?.Invoke("Extrayendo geometría (CPU)...", System.Drawing.Color.Blue);
-                                _depthExtractor ??= new DepthExtractor(app, DepthResolution);
-                                _depthExtractor.AutoDepthRange = this.AutoDepthRange;
-                                _depthExtractor.ManualDepthDistance = this.DepthRangeDistance;
-                                _depthExtractor.UseGpuAcceleration = false;
-                                _depthExtractor.UseGeometryExtraction = true;
-                                _depthExtractor.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners, this.OutputPath, timestamp);
-                                depthData = null; // La imagen se guarda directamente en el extractor
+                                catch (Exception ex)
+                                {
+                                    UpdateStatusCallback?.Invoke($"Error en proceso GPU: {ex.Message}", Drawing.Color.Red);
+                                    WabiSabiLogger.LogError("Error durante la operación con ModernProgressDialog", ex);
+                                    return; // Salir del método Execute
+                                }
                             }
                         }
-                        
-                        // Si no es modo Alta o si necesitamos usar fallback
-                        if (DepthQuality != 2 || useFallbackMode)
+                        else // Si no es modo Alta/GPU, o si hay fallback
                         {
+                            if (DepthQuality == 2 && !(UseGpuAcceleration && _gpuManager?.IsGpuAvailable == true))
+                            {
+                                UpdateStatusCallback?.Invoke("GPU no disponible, usando modo Normal.", Drawing.Color.Orange);
+                                useFallbackMode = true;
+                            }
+
                             // Usar el modo apropiado según la calidad
-                            int effectiveQuality = useFallbackMode ? 1 : DepthQuality; // Si es fallback, usar Normal
-                            
+                            int effectiveQuality = useFallbackMode ? 1 : DepthQuality;
+
                             _depthExtractorFast ??= new DepthExtractorFast(app, DepthResolution, effectiveQuality == 0 ? 4 : 2);
                             _depthExtractorFast.AutoDepthRange = this.AutoDepthRange;
                             _depthExtractorFast.ManualDepthDistance = this.DepthRangeDistance;
                             _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
                             depthData = _depthExtractorFast.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners);
                         }
+                        // --- FIN DE ACTUALIZACIÓN ---
                     }
                     catch (Exception ex)
                     {
@@ -312,10 +342,11 @@ namespace WabiSabiBridge
                         WabiSabiLogger.LogError("Error durante el cálculo de profundidad/líneas", ex);
                     }
                 }
+
                 // --- TAREA 4: Crear y encolar el trabajo (sin cambios) ---
                 var job = new ExportJob
                 {
-                    TempRenderPath = tempRenderPath ?? "", // Puede ser null/empty en modo GPU líneas
+                    TempRenderPath = tempRenderPath ?? "",
                     TargetWidth = targetWidth,
                     TargetHeight = targetHeight,
                     IsCropActive = isCropActive,
@@ -333,7 +364,7 @@ namespace WabiSabiBridge
                     CamUpX = orientation.UpDirection.X, CamUpY = orientation.UpDirection.Y, CamUpZ = orientation.UpDirection.Z,
                     ProjectName = doc.Title,
                     ProjectPath = doc.PathName,
-                    GpuAccelerated = this.UseGpuAcceleration && this.DepthQuality == 2, // Marcamos como acelerado solo en este modo
+                    GpuAccelerated = this.UseGpuAcceleration && this.DepthQuality == 2,
                     DepthData = depthData,
                     EventHandler = this
                 };
@@ -344,7 +375,7 @@ namespace WabiSabiBridge
                     WabiSabiBridgeApp._exportQueue.Enqueue(job);
                     UpdateStatusCallback?.Invoke($"Encolado: {job.Timestamp}", System.Drawing.Color.CornflowerBlue);
                 }
-                }
+            }
             catch (Exception ex)
             {
                 WabiSabiLogger.LogError("Error crítico en ExportEventHandler.Execute", ex);
@@ -354,14 +385,12 @@ namespace WabiSabiBridge
         
         // CAMBIO: El método se marca como static y se retiran parámetros no utilizados.
         private static IList<XYZ> GetEffectiveViewCorners(UIView uiView)
-        {            
-            return uiView.GetZoomCorners();            
+        {
+            return uiView.GetZoomCorners();
         }
 
-        // NUEVO MÉTODO: Genera y guarda una imagen desde un buffer RGBA de la GPU
         private void GenerateImageFromGpuBuffer(float[] buffer, int width, int height, string outputPath, string timestamp)
         {
-            // Validación de seguridad
             if (buffer == null || buffer.Length != width * height * 4)
             {
                 WabiSabiLogger.LogError($"Buffer inválido: esperado {width * height * 4} elementos, recibido {buffer?.Length ?? 0}");
@@ -369,51 +398,46 @@ namespace WabiSabiBridge
             }
             using var finalBitmap = new Drawing.Bitmap(width, height, PixelFormat.Format32bppArgb);
             BitmapData bmpData = finalBitmap.LockBits(new Drawing.Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, finalBitmap.PixelFormat);
-            
+
             try
             {
-                // SOLUCIÓN: Convertir float[] a byte[] correctamente
                 int pixelCount = width * height;
-                byte[] byteBuffer = new byte[pixelCount * 4]; // 4 bytes por pixel (ARGB)
-                
-                // Conversión paralela para mejor rendimiento
+                byte[] byteBuffer = new byte[pixelCount * 4];
+
                 Parallel.For(0, pixelCount, i =>
                 {
-                    // Los datos vienen como RGBA float [0,1], convertir a ARGB byte [0,255]
                     int srcIdx = i * 4;
                     int dstIdx = i * 4;
-                    
-                    // Clamp y conversión de float a byte
+
                     byteBuffer[dstIdx] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx + 3] * 255)));     // A
-                    byteBuffer[dstIdx + 1] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx] * 255)));     // R
-                    byteBuffer[dstIdx + 2] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx + 1] * 255))); // G
-                    byteBuffer[dstIdx + 3] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx + 2] * 255))); // B
+                    byteBuffer[dstIdx + 1] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx] * 255)));         // R
+                    byteBuffer[dstIdx + 2] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx + 1] * 255)));     // G
+                    byteBuffer[dstIdx + 3] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx + 2] * 255)));     // B
                 });
-                
-                // Ahora sí copiar los bytes correctamente
+
                 System.Runtime.InteropServices.Marshal.Copy(byteBuffer, 0, bmpData.Scan0, byteBuffer.Length);
             }
             finally
             {
                 finalBitmap.UnlockBits(bmpData);
             }
-            
+
             string targetFile = Path.Combine(outputPath, "current_render.png");
             finalBitmap.Save(targetFile, System.Drawing.Imaging.ImageFormat.Png);
-            
+
             if (SaveTimestampedRender)
             {
                 finalBitmap.Save(Path.Combine(outputPath, $"render_{timestamp}.png"), System.Drawing.Imaging.ImageFormat.Png);
             }
             WabiSabiLogger.Log($"Imagen de líneas (GPU) exportada: {targetFile}", LogLevel.Debug);
         }
-        
-        private void ExportHiddenLineImage(Document doc, View3D view3D, string outputPath, string timestamp, 
+
+        private void ExportHiddenLineImage(Document doc, View3D view3D, string outputPath, string timestamp,
             int targetWidth, int targetHeight, bool isCropActive)
         {
-            WabiSabiLogger.LogDiagnostic("Export", 
+            WabiSabiLogger.LogDiagnostic("Export",
                 $"ExportHiddenLineImage - Res: {targetWidth}x{targetHeight}, Crop: {isCropActive}");
-            
+
             var options = new ImageExportOptions
             {
                 FilePath = Path.Combine(outputPath, $"render_{timestamp}"),
@@ -430,22 +454,18 @@ namespace WabiSabiBridge
 
             if (!File.Exists(generatedFile)) return;
 
-            // CAMBIO: La instrucción "using" se simplifica.
             using var originalImage = Drawing.Image.FromFile(generatedFile);
             using var finalBitmap = new Drawing.Bitmap(targetWidth, targetHeight);
-            
+
             finalBitmap.SetResolution(originalImage.HorizontalResolution, originalImage.VerticalResolution);
-            // CAMBIO: La instrucción "using" se simplifica.
             using (var g = Drawing.Graphics.FromImage(finalBitmap))
             {
                 g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
                 g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
-                // --- ACTIVAR ANTI-ALIASING ---
-                // Esta es la línea clave que suaviza los bordes de líneas y curvas.
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
                 g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
                 g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-                
+
                 Drawing.Rectangle sourceRect = isCropActive
                     ? new Drawing.Rectangle(
                         (int)(view3D.Outline.Min.U * originalImage.Width),
@@ -456,7 +476,7 @@ namespace WabiSabiBridge
 
                 float srcAspect = (float)sourceRect.Width / sourceRect.Height;
                 float dstAspect = (float)targetWidth / targetHeight;
-                
+
                 Drawing.Rectangle destRect = srcAspect > dstAspect
                     ? new Drawing.Rectangle(0, (targetHeight - (int)(targetWidth / srcAspect)) / 2, targetWidth, (int)(targetWidth / srcAspect))
                     : new Drawing.Rectangle((targetWidth - (int)(targetHeight * srcAspect)) / 2, 0, (int)(targetHeight * srcAspect), targetHeight);
@@ -465,7 +485,7 @@ namespace WabiSabiBridge
                 g.DrawImage(originalImage, destRect, sourceRect, Drawing.GraphicsUnit.Pixel);
             }
             finalBitmap.Save(targetFile, System.Drawing.Imaging.ImageFormat.Png);
-            
+
             if (!SaveTimestampedRender)
             {
                 try { File.Delete(generatedFile); } catch { }
@@ -477,17 +497,14 @@ namespace WabiSabiBridge
         {
             WabiSabiLogger.LogDiagnostic("Export", "Exportando metadata...");
 
-            
-            // Obtenemos la orientación real de la cámara en el momento de la exportación.
             var orientation = view3D.GetOrientation();
             var eyePos = orientation.EyePosition;
             var forwardDir = orientation.ForwardDirection;
-            // El "target" se puede calcular proyectando un punto a lo largo de la dirección de la vista.
-            var targetPos = eyePos + forwardDir.Multiply(10); // Distancia arbitraria de 10 unidades
+            var targetPos = eyePos + forwardDir.Multiply(10);
             var upVec = orientation.UpDirection;
-            
-            
-            var metadata = new {
+
+            var metadata = new
+            {
                 timestamp,
                 view3D.Name,
                 view_type = "3D",
@@ -495,23 +512,19 @@ namespace WabiSabiBridge
                 detail_level = view3D.DetailLevel.ToString(),
                 display_style = view3D.DisplayStyle.ToString(),
                 crop_box_active = view3D.CropBoxActive,
-                
-                // --- CORRECCIÓN: Usamos los valores reales de la cámara ---
-                camera = new {
+                camera = new
+                {
                     eye_position = new { x = eyePos.X, y = eyePos.Y, z = eyePos.Z },
                     target_position = new { x = targetPos.X, y = targetPos.Y, z = targetPos.Z },
                     up_vector = new { x = upVec.X, y = upVec.Y, z = upVec.Z }
                 },
-                
-
                 project_info = new { name = doc.Title, path = doc.PathName },
                 gpu_acceleration = UseGpuAcceleration
             };
             File.WriteAllText(Path.Combine(outputPath, "current_metadata.json"), JsonConvert.SerializeObject(metadata, Formatting.Indented));
             WabiSabiLogger.Log("Metadata exportada", LogLevel.Debug);
         }
-        
-        // CAMBIO: El miembro se marca como static porque no accede a datos de la instancia.
+
         private static void CreateNotificationFile(string outputPath, string timestamp)
         {
             WabiSabiLogger.LogDiagnostic("Export", "Creando archivo de notificación...");
@@ -520,8 +533,7 @@ namespace WabiSabiBridge
         }
 
         public void Dispose() { _depthExtractor?.Dispose(); _depthExtractorFast?.Dispose(); }
-        
-        // NUEVO MÉTODO: Genera y guarda la imagen de profundidad
+
         public void GenerateDepthImage(double[,] depthData, int width, int height, string outputPath, string timestamp, bool saveTimestampedDepth)
         {
             using var depthMap = new Drawing.Bitmap(width, height, PixelFormat.Format24bppRgb);
@@ -529,9 +541,11 @@ namespace WabiSabiBridge
             unsafe
             {
                 byte* ptr = (byte*)bmpData.Scan0;
-                Parallel.For(0, height, y => {
+                Parallel.For(0, height, y =>
+                {
                     byte* row = ptr + (y * bmpData.Stride);
-                    for (int x = 0; x < width; x++) {
+                    for (int x = 0; x < width; x++)
+                    {
                         byte depthValue = (byte)(Math.Max(0.0, Math.Min(1.0, depthData[y, x])) * 255);
                         row[x * 3] = depthValue; row[x * 3 + 1] = depthValue; row[x * 3 + 2] = depthValue;
                     }
@@ -541,17 +555,17 @@ namespace WabiSabiBridge
 
             var encoderParams = new EncoderParameters(1) { Param = { [0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 90L) } };
             var pngCodec = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == System.Drawing.Imaging.ImageFormat.Png.Guid);
-            
+
             string currentDepthPath = Path.Combine(outputPath, "current_depth.png");
             depthMap.Save(currentDepthPath, pngCodec, encoderParams);
 
-            if (saveTimestampedDepth) 
+            if (saveTimestampedDepth)
             {
                 depthMap.Save(Path.Combine(outputPath, $"depth_{timestamp}.png"), pngCodec, encoderParams);
             }
             WabiSabiLogger.Log($"Mapa de profundidad guardado: {currentDepthPath}", LogLevel.Debug);
         }
-        
+
         private double CalculateMaxDepth(View3D view3D, XYZ eyePosition, XYZ forwardDirection, XYZ viewCenter)
         {
             if (!AutoDepthRange) return DepthRangeDistance;
@@ -572,11 +586,8 @@ namespace WabiSabiBridge
 
             return distanceToTarget > 0 ? distanceToTarget * 1.2 : (view3D.Outline.Max.U - view3D.Outline.Min.U) / (2.0 * Math.Tan(Math.PI / 6.0)) * 1.5;
         }
-        
-        
 
         public string GetName() => "WabiSabi Bridge Export Event";
-        
     }
     /// Ventana principal del plugin
     /// </summary>
@@ -617,98 +628,404 @@ namespace WabiSabiBridge
         
         private void InitializeComponent()
         {
-            Text = "WabiSabi Bridge - v0.3.3 (High-Perf)"; Size = new Drawing.Size(420, 680); StartPosition = WinForms.FormStartPosition.CenterScreen;
-            FormBorderStyle = WinForms.FormBorderStyle.FixedDialog; MaximizeBox = false;
+            Text = "WabiSabi Bridge v0.3.3";
+            Size = new Drawing.Size(500, 720);
+            StartPosition = WinForms.FormStartPosition.CenterScreen;
+            FormBorderStyle = WinForms.FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
             
-            var mainLayout = new WinForms.TableLayoutPanel { Dock = WinForms.DockStyle.Fill, ColumnCount = 1, Padding = new WinForms.Padding(10) };
+            // Usar un panel principal con margen
+            var mainPanel = new WinForms.Panel
+            {
+                Dock = WinForms.DockStyle.Fill,
+                Padding = new WinForms.Padding(15),
+                BackColor = Drawing.Color.White
+            };
             
-            #region UI Controls Initialization
-            var pathPanel = new WinForms.Panel { Height = 30, Dock = WinForms.DockStyle.Fill };
-            pathPanel.Controls.Add(new WinForms.Label { Text = "Carpeta de salida:", Width = 100, TextAlign = Drawing.ContentAlignment.MiddleLeft });
-            _outputPathTextBox = new WinForms.TextBox { Text = _config.OutputPath, Left = 105, Width = 200, Top = 3 };
-            var browseButton = new WinForms.Button { Text = "...", Left = 310, Width = 30, Top = 2 };
+            // === SECCIÓN 1: Carpeta de salida ===
+            var outputGroup = new WinForms.GroupBox
+            {
+                Text = "Configuración de Salida",
+                Location = new Drawing.Point(15, 15),
+                Size = new Drawing.Size(455, 80),
+                Font = new Drawing.Font("Segoe UI", 9F, Drawing.FontStyle.Bold)
+            };
+            
+            var outputLabel = new WinForms.Label
+            {
+                Text = "Carpeta:",
+                Location = new Drawing.Point(15, 30),
+                Size = new Drawing.Size(60, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+            
+            _outputPathTextBox = new WinForms.TextBox
+            {
+                Location = new Drawing.Point(80, 30),
+                Size = new Drawing.Size(280, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                Text = _config.OutputPath
+            };
+            
+            var browseButton = new WinForms.Button
+            {
+                Text = "Examinar...",
+                Location = new Drawing.Point(365, 29),
+                Size = new Drawing.Size(75, 27),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                FlatStyle = WinForms.FlatStyle.System
+            };
             browseButton.Click += (s, e) => {
                 using (var dialog = new WinForms.FolderBrowserDialog { SelectedPath = _outputPathTextBox.Text })
-                    if (dialog.ShowDialog() == WinForms.DialogResult.OK) { _outputPathTextBox.Text = dialog.SelectedPath; _config.OutputPath = dialog.SelectedPath; _config.Save(); }
+                    if (dialog.ShowDialog() == WinForms.DialogResult.OK) {
+                        _outputPathTextBox.Text = dialog.SelectedPath;
+                        _config.OutputPath = dialog.SelectedPath;
+                        _config.Save();
+                    }
             };
-            pathPanel.Controls.Add(_outputPathTextBox); pathPanel.Controls.Add(browseButton);
-
-            var exportButton = new WinForms.Button { Text = "Exportar Vista Actual", Height = 40, Dock = WinForms.DockStyle.Fill, Font = new Drawing.Font(Font.FontFamily, 10, Drawing.FontStyle.Bold) };
+            
+            outputGroup.Controls.AddRange(new WinForms.Control[] { outputLabel, _outputPathTextBox, browseButton });
+            
+            // === BOTÓN PRINCIPAL DE EXPORTAR ===
+            var exportButton = new WinForms.Button
+            {
+                Text = "EXPORTAR VISTA ACTUAL",
+                Location = new Drawing.Point(15, 105),
+                Size = new Drawing.Size(455, 45),
+                Font = new Drawing.Font("Segoe UI", 10F, Drawing.FontStyle.Bold),
+                BackColor = Drawing.Color.FromArgb(0, 120, 215),
+                ForeColor = Drawing.Color.White,
+                FlatStyle = WinForms.FlatStyle.Flat,
+                Cursor = WinForms.Cursors.Hand
+            };
+            exportButton.FlatAppearance.BorderSize = 0;
             exportButton.Click += (s, e) => ExportCurrentView();
             
-            var exportOptionsGroup = new WinForms.GroupBox { Text = "Opciones de exportación", Height = 125, Dock = WinForms.DockStyle.Fill };
-            _exportDepthCheckBox = new WinForms.CheckBox { Text = "Generar mapa de profundidad", Location = new Drawing.Point(10, 20), Width = 200, Checked = _config.ExportDepth };
-            _exportDepthCheckBox.CheckedChanged += (s, e) => { _config.ExportDepth = _exportDepthCheckBox.Checked; UpdateDepthControls(); _config.Save(); };
-            
-            exportOptionsGroup.Controls.Add(new WinForms.Label { Text = "Resolución:", Location = new Drawing.Point(30, 45), Width = 70 });
-            _depthResolutionCombo = new WinForms.ComboBox { Location = new Drawing.Point(100, 43), Width = 100, DropDownStyle = WinForms.ComboBoxStyle.DropDownList };
-            _depthResolutionCombo.Items.AddRange(new object[] { "256", "512", "1024", "2048" });
-            _depthResolutionCombo.SelectedItem = _config.DepthResolution.ToString();
-            _depthResolutionCombo.SelectedIndexChanged += (s, e) => { if (int.TryParse(_depthResolutionCombo.SelectedItem?.ToString(), out int res)) _config.DepthResolution = res; _config.Save(); UpdateTimeEstimate(); };
-
-            exportOptionsGroup.Controls.Add(new WinForms.Label { Text = "Calidad:", Location = new Drawing.Point(220, 45), Width = 50 });
-            _depthQualityCombo = new WinForms.ComboBox { Location = new Drawing.Point(270, 43), Width = 80, DropDownStyle = WinForms.ComboBoxStyle.DropDownList };
-            _depthQualityCombo.Items.AddRange(new object[] { "Rápida", "Normal", "Alta (Geometría/GPU)" });
-            _depthQualityCombo.SelectedIndex = _config.DepthQuality;
-            _depthQualityCombo.SelectedIndexChanged += (s, e) => { _config.DepthQuality = _depthQualityCombo.SelectedIndex; _config.Save(); UpdateTimeEstimate(); };
-
-            var timeEstimateLabel = new WinForms.Label { Name = "timeEstimateLabel", Location = new Drawing.Point(30, 70), Width = 320, ForeColor = Drawing.Color.Gray, Font = new Drawing.Font(Font.FontFamily, 8) };
-            
-            _gpuAccelerationCheckBox = new WinForms.CheckBox { Text = "Aceleración GPU", Location = new Drawing.Point(30, 95), Width = 130, Checked = _config.UseGpuAcceleration };
-            _gpuAccelerationCheckBox.CheckedChanged += (s, e) => { _config.UseGpuAcceleration = _gpuAccelerationCheckBox.Checked; UpdateGpuControls(); _config.Save(); };
-            _geometryExtractionCheckBox = new WinForms.CheckBox { Text = "Modo Experimental", Location = new Drawing.Point(170, 95), Width = 140, Checked = _config.UseGeometryExtraction, ForeColor = Drawing.Color.DarkOrange };
-            _geometryExtractionCheckBox.CheckedChanged += (s, e) => { _config.UseGeometryExtraction = _geometryExtractionCheckBox.Checked; _config.Save(); UpdateTimeEstimate(); };
-            
-            exportOptionsGroup.Controls.AddRange(new WinForms.Control[] { _exportDepthCheckBox, _depthResolutionCombo, _depthQualityCombo, timeEstimateLabel, _gpuAccelerationCheckBox, _geometryExtractionCheckBox });
-
-            var cacheInfoPanel = new WinForms.Panel { Height = 40, Dock = WinForms.DockStyle.Fill };
-            _cacheStatusLabel = new WinForms.Label { Text = "Caché: No inicializado", Dock = WinForms.DockStyle.Fill, TextAlign = Drawing.ContentAlignment.MiddleLeft, Font = new Drawing.Font(Font.FontFamily, 8), ForeColor = Drawing.Color.Gray };
-            _clearCacheButton = new WinForms.Button { Text = "Limpiar Caché", Width = 100, Height = 25, Dock = WinForms.DockStyle.Right, BackColor = Drawing.Color.LightCoral, ForeColor = Drawing.Color.White, FlatStyle = WinForms.FlatStyle.Flat };
-            _clearCacheButton.Click += (s, e) => {
-                if (WinForms.MessageBox.Show("¿Limpiar el caché de geometría?", "Confirmar", WinForms.MessageBoxButtons.YesNo, WinForms.MessageBoxIcon.Question) == WinForms.DialogResult.Yes) {
-                    GeometryCacheManager.Instance.InvalidateCache(); UpdateStatus("Caché limpiado.", Drawing.Color.Orange); UpdateCacheStatus(); }
+            // === SECCIÓN 2: Opciones de exportación ===
+            var exportOptionsGroup = new WinForms.GroupBox
+            {
+                Text = "Opciones de Profundidad",
+                Location = new Drawing.Point(15, 165),
+                Size = new Drawing.Size(455, 180),
+                Font = new Drawing.Font("Segoe UI", 9F, Drawing.FontStyle.Bold)
             };
-            cacheInfoPanel.Controls.Add(_cacheStatusLabel); cacheInfoPanel.Controls.Add(_clearCacheButton);
-
-            var depthRangePanel = new WinForms.Panel { Height = 60, Dock = WinForms.DockStyle.Fill };
-            depthRangePanel.Controls.Add(new WinForms.Label { Text = "Distancia focal:", Location = new Drawing.Point(10, 5), Width = 100 });
-            _autoDepthCheckBox = new WinForms.CheckBox { Text = "Auto", Location = new Drawing.Point(280, 5), Width = 50, Checked = _config.AutoDepthRange };
-            _depthRangeTrackBar = new WinForms.TrackBar { Location = new Drawing.Point(10, 25), Width = 260, Minimum = 10, Maximum = 500, Value = (int)_config.DepthRangeDistance, TickFrequency = 50 };
-            _depthRangeValueLabel = new WinForms.Label { Text = _config.AutoDepthRange ? "Auto" : $"{_config.DepthRangeDistance} ft", Location = new Drawing.Point(280, 30), Width = 80, TextAlign = Drawing.ContentAlignment.MiddleLeft };
-            _autoDepthCheckBox.CheckedChanged += (s, e) => { _config.AutoDepthRange = _autoDepthCheckBox.Checked; _depthRangeTrackBar.Enabled = !_config.AutoDepthRange; _depthRangeValueLabel.Text = _autoDepthCheckBox.Checked ? "Auto" : $"{_depthRangeTrackBar.Value} ft"; _config.Save(); };
-            _depthRangeTrackBar.ValueChanged += (s, e) => { _depthRangeValueLabel.Text = $"{_depthRangeTrackBar.Value} ft"; _config.DepthRangeDistance = _depthRangeTrackBar.Value; _config.Save(); };
-            depthRangePanel.Controls.AddRange(new WinForms.Control[] { _autoDepthCheckBox, _depthRangeTrackBar, _depthRangeValueLabel });
-
-            _autoExportCheckBox = new WinForms.CheckBox { Text = "Exportación automática al mover cámara", Dock = WinForms.DockStyle.Fill, Checked = _config.AutoExport };
-            _autoExportCheckBox.CheckedChanged += (s, e) => { _config.AutoExport = _autoExportCheckBox.Checked; _config.Save(); WabiSabiBridgeApp.SetAutoExportEnabled(_autoExportCheckBox.Checked, _uiApp); };
-
-            var saveOptionsGroup = new WinForms.GroupBox { Text = "Opciones de Guardado", Dock = WinForms.DockStyle.Fill, Height = 50 };
-            _saveRenderCheckBox = new WinForms.CheckBox { Text = "Guardar Render con Timestamp", Location = new Drawing.Point(10, 20), Width = 200, Checked = _config.SaveTimestampedRender };
-            _saveRenderCheckBox.CheckedChanged += (s, e) => { _config.SaveTimestampedRender = _saveRenderCheckBox.Checked; _config.Save(); };
-            _saveDepthCheckBox = new WinForms.CheckBox { Text = "Guardar Depth con Timestamp", Location = new Drawing.Point(210, 20), Width = 200, Checked = _config.SaveTimestampedDepth };
-            _saveDepthCheckBox.CheckedChanged += (s, e) => { _config.SaveTimestampedDepth = _saveDepthCheckBox.Checked; _config.Save(); };
-            saveOptionsGroup.Controls.AddRange(new WinForms.Control[] { _saveRenderCheckBox, _saveDepthCheckBox });
             
-            var gpuStatusLabel = new WinForms.Label { Name = "gpuStatusLabel", Text = "Verificando GPU...", Dock = WinForms.DockStyle.Fill, TextAlign = Drawing.ContentAlignment.MiddleCenter, ForeColor = Drawing.Color.Gray, Font = new Drawing.Font(Font.FontFamily, 8) };
-
-            _statusLabel = new WinForms.Label { Text = "Listo para exportar", Dock = WinForms.DockStyle.Fill, TextAlign = Drawing.ContentAlignment.MiddleCenter, ForeColor = Drawing.Color.Green, Font = new Drawing.Font(Font.FontFamily, 9) };
-                        
-            mainLayout.Controls.AddRange(new WinForms.Control[] { pathPanel, exportButton, exportOptionsGroup, cacheInfoPanel, depthRangePanel, _autoExportCheckBox, saveOptionsGroup, gpuStatusLabel, _statusLabel });
-
-            Controls.Add(mainLayout);
+            _exportDepthCheckBox = new WinForms.CheckBox
+            {
+                Text = "Exportar mapa de profundidad",
+                Location = new Drawing.Point(15, 25),
+                Size = new Drawing.Size(200, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                Checked = _config.ExportDepth
+            };
             
+            var resolutionLabel = new WinForms.Label
+            {
+                Text = "Resolución:",
+                Location = new Drawing.Point(15, 55),
+                Size = new Drawing.Size(80, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+            
+            _depthResolutionCombo = new WinForms.ComboBox
+            {
+                Location = new Drawing.Point(100, 55),
+                Size = new Drawing.Size(120, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                DropDownStyle = WinForms.ComboBoxStyle.DropDownList
+            };
+            _depthResolutionCombo.Items.AddRange(new object[] { "256", "512", "1024", "2048" });
+            _depthResolutionCombo.Text = _config.DepthResolution.ToString();
+            
+            var qualityLabel = new WinForms.Label
+            {
+                Text = "Calidad:",
+                Location = new Drawing.Point(240, 55),
+                Size = new Drawing.Size(60, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+            
+            _depthQualityCombo = new WinForms.ComboBox
+            {
+                Location = new Drawing.Point(305, 55),
+                Size = new Drawing.Size(135, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                DropDownStyle = WinForms.ComboBoxStyle.DropDownList
+            };
+            _depthQualityCombo.Items.AddRange(new object[] { "Baja", "Media", "Alta (GPU)" });
+            _depthQualityCombo.SelectedIndex = _config.DepthQuality;
+            
+            _gpuAccelerationCheckBox = new WinForms.CheckBox
+            {
+                Text = "Aceleración GPU",
+                Location = new Drawing.Point(15, 90),
+                Size = new Drawing.Size(150, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                Checked = _config.UseGpuAcceleration
+            };
+            
+            _geometryExtractionCheckBox = new WinForms.CheckBox
+            {
+                Text = "Modo Experimental",
+                Location = new Drawing.Point(170, 90),
+                Size = new Drawing.Size(150, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                ForeColor = Drawing.Color.DarkOrange,
+                Checked = _config.UseGeometryExtraction
+            };
+            
+            var timeEstimateLabel = new WinForms.Label
+            {
+                Name = "timeEstimateLabel",
+                Location = new Drawing.Point(15, 120),
+                Size = new Drawing.Size(425, 20),
+                Font = new Drawing.Font("Segoe UI", 8F, Drawing.FontStyle.Italic),
+                ForeColor = Drawing.Color.Gray,
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+            
+            var gpuStatusLabel = new WinForms.Label
+            {
+                Name = "gpuStatusLabel",
+                Location = new Drawing.Point(15, 145),
+                Size = new Drawing.Size(425, 20),
+                Font = new Drawing.Font("Segoe UI", 8F),
+                ForeColor = Drawing.Color.Gray,
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+            
+            exportOptionsGroup.Controls.AddRange(new WinForms.Control[] {
+                _exportDepthCheckBox, resolutionLabel, _depthResolutionCombo,
+                qualityLabel, _depthQualityCombo, _gpuAccelerationCheckBox,
+                _geometryExtractionCheckBox, timeEstimateLabel, gpuStatusLabel
+            });
+            
+            // === SECCIÓN 3: Información del caché ===
+            var cacheGroup = new WinForms.GroupBox
+            {
+                Text = "Estado del Caché",
+                Location = new Drawing.Point(15, 355),
+                Size = new Drawing.Size(455, 80),
+                Font = new Drawing.Font("Segoe UI", 9F, Drawing.FontStyle.Bold)
+            };
+            
+            _cacheStatusLabel = new WinForms.Label
+            {
+                Location = new Drawing.Point(15, 25),
+                Size = new Drawing.Size(320, 40),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                TextAlign = Drawing.ContentAlignment.MiddleLeft,
+                Text = "Caché: No inicializado"
+            };
+            
+            _clearCacheButton = new WinForms.Button
+            {
+                Text = "Limpiar",
+                Location = new Drawing.Point(345, 30),
+                Size = new Drawing.Size(95, 30),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                BackColor = Drawing.Color.FromArgb(255, 200, 200),
+                FlatStyle = WinForms.FlatStyle.Flat,
+                Cursor = WinForms.Cursors.Hand
+            };
+            _clearCacheButton.FlatAppearance.BorderSize = 0;
+            _clearCacheButton.Click += (s, e) => {
+                if (WinForms.MessageBox.Show("¿Limpiar el caché de geometría?\n\nEsto forzará la reconstrucción en la próxima exportación.",
+                    "Confirmar limpieza", WinForms.MessageBoxButtons.YesNo, WinForms.MessageBoxIcon.Question) == WinForms.DialogResult.Yes)
+                {
+                    GeometryCacheManager.Instance.InvalidateCache();
+                    UpdateStatus("Caché limpiado", Drawing.Color.Orange);
+                    UpdateCacheStatus();
+                }
+            };
+            
+            cacheGroup.Controls.AddRange(new WinForms.Control[] { _cacheStatusLabel, _clearCacheButton });
+            
+            // === SECCIÓN 4: Opciones adicionales ===
+            var additionalGroup = new WinForms.GroupBox
+            {
+                Text = "Opciones Adicionales",
+                Location = new Drawing.Point(15, 445),
+                Size = new Drawing.Size(455, 200),
+                Font = new Drawing.Font("Segoe UI", 9F, Drawing.FontStyle.Bold)
+            };
+            
+            _autoExportCheckBox = new WinForms.CheckBox
+            {
+                Text = "Auto-exportar al mover cámara",
+                Location = new Drawing.Point(15, 25),
+                Size = new Drawing.Size(250, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                Checked = _config.AutoExport
+            };
+            
+            _autoDepthCheckBox = new WinForms.CheckBox
+            {
+                Text = "Rango de profundidad automático",
+                Location = new Drawing.Point(15, 50),
+                Size = new Drawing.Size(250, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                Checked = _config.AutoDepthRange
+            };
+
+            var depthRangeLabel = new WinForms.Label
+            {
+                Text = "Rango Manual:",
+                Location = new Drawing.Point(15, 78),
+                Size = new Drawing.Size(90, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+
+            _depthRangeTrackBar = new WinForms.TrackBar
+            {
+                Location = new Drawing.Point(105, 75),
+                Size = new Drawing.Size(250, 25),
+                Minimum = 10,
+                Maximum = 500,
+                TickFrequency = 10,
+                Value = (int)_config.DepthRangeDistance,
+                Enabled = !_config.AutoDepthRange // Se activa si el modo automático está desactivado
+            };
+
+            _depthRangeValueLabel = new WinForms.Label
+            {
+                Location = new Drawing.Point(365, 78),
+                Size = new Drawing.Size(75, 25),
+                Font = new Drawing.Font("Segoe UI", 9F, Drawing.FontStyle.Bold),
+                TextAlign = Drawing.ContentAlignment.MiddleLeft,
+                Text = $"{_depthRangeTrackBar.Value}m",
+                Enabled = !_config.AutoDepthRange
+            };
+            
+            _saveRenderCheckBox = new WinForms.CheckBox
+            {
+                Text = "Guardar renders con timestamp",
+                Location = new Drawing.Point(15, 130),
+                Size = new Drawing.Size(250, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                Checked = _config.SaveTimestampedRender
+            };
+            
+            _saveDepthCheckBox = new WinForms.CheckBox
+            {
+                Text = "Guardar profundidad con timestamp",
+                Location = new Drawing.Point(15, 155),
+                Size = new Drawing.Size(250, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                Checked = _config.SaveTimestampedDepth
+            };
+            
+            additionalGroup.Controls.AddRange(new WinForms.Control[] {
+                _autoExportCheckBox, _autoDepthCheckBox, depthRangeLabel, _depthRangeTrackBar, _depthRangeValueLabel, _saveRenderCheckBox, _saveDepthCheckBox
+            });
+            
+            // === BARRA DE ESTADO ===
+            var statusPanel = new WinForms.Panel
+            {
+                Location = new Drawing.Point(15, 595),
+                Size = new Drawing.Size(455, 50),
+                BorderStyle = WinForms.BorderStyle.FixedSingle
+            };
+            
+            _statusLabel = new WinForms.Label
+            {
+                Dock = WinForms.DockStyle.Fill,
+                Font = new Drawing.Font("Segoe UI", 10F, Drawing.FontStyle.Bold),
+                TextAlign = Drawing.ContentAlignment.MiddleCenter,
+                Text = "Listo para exportar",
+                ForeColor = Drawing.Color.Green
+            };
+            
+            statusPanel.Controls.Add(_statusLabel);
+            
+            // Agregar todos los controles al panel principal
+            mainPanel.Controls.AddRange(new WinForms.Control[] {
+                outputGroup, exportButton, exportOptionsGroup, cacheGroup, additionalGroup, statusPanel
+            });
+            
+            Controls.Add(mainPanel);
+            
+            // Configurar eventos
+            _exportDepthCheckBox.CheckedChanged += (s, e) => {
+                _config.ExportDepth = _exportDepthCheckBox.Checked;
+                _config.Save();
+                UpdateDepthControls();
+                UpdateTimeEstimate();
+            };
+            
+            _depthResolutionCombo.SelectedIndexChanged += (s, e) => {
+                _config.DepthResolution = int.Parse(_depthResolutionCombo.Text);
+                _config.Save();
+                UpdateTimeEstimate();
+            };
+            
+            _depthQualityCombo.SelectedIndexChanged += (s, e) => {
+                _config.DepthQuality = _depthQualityCombo.SelectedIndex;
+                _config.Save();
+                UpdateTimeEstimate();
+            };
+            
+            _gpuAccelerationCheckBox.CheckedChanged += (s, e) => {
+                _config.UseGpuAcceleration = _gpuAccelerationCheckBox.Checked;
+                _config.Save();
+                UpdateGpuControls();
+                UpdateTimeEstimate();
+            };
+            
+            _geometryExtractionCheckBox.CheckedChanged += (s, e) => {
+                _config.UseGeometryExtraction = _geometryExtractionCheckBox.Checked;
+                _config.Save();
+                UpdateTimeEstimate();
+            };
+            
+            _autoExportCheckBox.CheckedChanged += (s, e) => {
+                _config.AutoExport = _autoExportCheckBox.Checked;
+                _config.Save();
+            };
+            
+            _autoDepthCheckBox.CheckedChanged += (s, e) => {
+                _config.AutoDepthRange = _autoDepthCheckBox.Checked;
+                _config.Save();
+                _depthRangeTrackBar.Enabled = !_autoDepthCheckBox.Checked;
+                _depthRangeValueLabel.Enabled = !_autoDepthCheckBox.Checked;
+            };
+            
+            _saveRenderCheckBox.CheckedChanged += (s, e) => {
+                _config.SaveTimestampedRender = _saveRenderCheckBox.Checked;
+                _config.Save();
+            };
+            
+            _saveDepthCheckBox.CheckedChanged += (s, e) => {
+                _config.SaveTimestampedDepth = _saveDepthCheckBox.Checked;
+                _config.Save();
+            };
+
+            _depthRangeTrackBar.Scroll += (s, e) => {
+                _depthRangeValueLabel.Text = $"{_depthRangeTrackBar.Value}m";
+                _config.DepthRangeDistance = _depthRangeTrackBar.Value;
+                // Guardar la configuración al soltar el control deslizante para no sobrecargar
+            };
+            _depthRangeTrackBar.MouseUp += (s, e) => {
+                _config.Save();
+            };
+            
+            // Timer para actualizar el estado del caché
             _cacheStatusTimer = new WinForms.Timer { Interval = 1000 };
             _cacheStatusTimer.Tick += (s, e) => UpdateCacheStatus();
             _cacheStatusTimer.Start();
             
+            // Inicializar estados
             UpdateDepthControls();
             UpdateGpuControls();
+            UpdateTimeEstimate();
+            CheckGpuStatus();
             #endregion
         }
         
-        
-
-
         public void ExportCurrentView()
         {
             try
@@ -814,7 +1131,7 @@ namespace WabiSabiBridge
         #endregion
     }
 
-    #endregion
+    
 
     #region Clase Principal de la Aplicación (Refactorizada y Corregida)
 
@@ -1303,7 +1620,7 @@ namespace WabiSabiBridge
                         "WabiSabiDiagnostic", 
                         "Diagnóstico", 
                         thisAssemblyPath, 
-                        "WabiSabiBridge.WabiSabiBridgeApp+WabiSabiDiagnosticCommand")
+                        "WabiSabiBridge.WabiSabiDiagnosticCommand")  // <- Nombre correcto de la clase
                     {
                         ToolTip = "Ejecutar diagnóstico del sistema",
                         LongDescription = "Verifica el estado de todos los componentes de WabiSabi Bridge"

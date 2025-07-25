@@ -1,4 +1,4 @@
-// GeometryCacheManager.cs - Gestor de caché de geometría con lógica de invalidación corregida
+// GeometryCacheManager.cs --- VERSIÓN ACTUALIZADA CON PROCESAMIENTO ASÍNCRONO Y MEJOR FEEDBACK ---
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -6,6 +6,8 @@ using System.IO.MemoryMappedFiles;
 using System.Linq;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using Autodesk.Revit.DB;
 using Drawing = System.Drawing;
 
@@ -36,6 +38,19 @@ namespace WabiSabiBridge.Extractors.Cache
         private GeometryCacheManager() 
         {
             System.Diagnostics.Debug.WriteLine("GeometryCacheManager: Inicializado");
+        }
+
+        // --- NUEVO: MÉTODO ASÍNCRONO QUE NO BLOQUEA LA UI ---
+        public async Task<CachedGeometryData> EnsureCacheIsValidAsync(
+            Document doc,
+            View3D view3D,
+            Action<string, Drawing.Color>? updateStatusCallback = null,
+            CancellationToken cancellationToken = default)
+        {
+            return await Task.Run(() =>
+            {
+                return EnsureCacheIsValid(doc, view3D, updateStatusCallback);
+            }, cancellationToken);
         }
         
         // --- MÉTODO CORREGIDO: LÓGICA DE INVALIDACIÓN REFINADA ---
@@ -87,8 +102,8 @@ namespace WabiSabiBridge.Extractors.Cache
                 VertexCount = VertexCount,
                 TriangleCount = TriangleCount,
                 VerticesOffset = 0,
-                IndicesOffset = VertexCount * 3 * sizeof(float),
-                NormalsOffset = VertexCount * 3 * sizeof(float) + TriangleCount * 3 * sizeof(int)
+                IndicesOffset = (long)VertexCount * 3 * sizeof(float),
+                NormalsOffset = (long)VertexCount * 3 * sizeof(float) + (long)TriangleCount * 3 * sizeof(int)
             };
         }
         
@@ -142,54 +157,17 @@ namespace WabiSabiBridge.Extractors.Cache
             }
         }
 
-        // El resto del archivo no necesita cambios, pero lo incluyo para que sea un reemplazo completo.
         private void RebuildCache(Document doc, View3D view3D, Action<string, Drawing.Color>? updateStatusCallback)
         {
             try
             {
                 DisposeCurrentCache();
                 updateStatusCallback?.Invoke("Extrayendo geometría del modelo...", Drawing.Color.Blue);
+                
                 var sceneData = ExtractSceneGeometry(doc, view3D, updateStatusCallback);
                 
-                // --- INICIO DE LA CORRECCIÓN ---
-                // 1. Calcular el tamaño primero
-                long vertexDataSize = (long)sceneData.Vertices.Count * sizeof(float);
-                long indexDataSize = (long)sceneData.Triangles.Count * sizeof(int);
-                long normalDataSize = (long)sceneData.Normals.Count * sizeof(float);
-                CacheSizeBytes = vertexDataSize + indexDataSize + normalDataSize;
+                WriteToMemoryMappedFile(sceneData, updateStatusCallback);
 
-                // 2. Comprobar si el tamaño es cero ANTES de crear el MMF
-                if (CacheSizeBytes == 0)
-                {
-                    updateStatusCallback?.Invoke("Advertencia: No se encontró geometría visible para cachear.", Drawing.Color.Orange);
-                    _isCacheValid = false;
-                    return; // Salir de forma segura
-                }
-                // --- FIN DE LA CORRECCIÓN ---
-                
-                string mmfName = $"WabiSabi_GeometryCache_{Guid.NewGuid():N}";
-                _geometryMmf = MemoryMappedFile.CreateNew(mmfName, CacheSizeBytes, MemoryMappedFileAccess.ReadWrite);
-                _geometryAccessor = _geometryMmf.CreateViewAccessor();
-                
-                updateStatusCallback?.Invoke("Escribiendo datos al caché de geometría...", Drawing.Color.Blue);
-                
-                // Escribir datos en buffers antes de pasarlos al MMF para eficiencia
-                var vertexArray = sceneData.Vertices.ToArray();
-                var indexArray = sceneData.Triangles.ToArray();
-                var normalArray = sceneData.Normals.ToArray();
-                
-                long offset = 0;
-                _geometryAccessor.WriteArray(offset, vertexArray, 0, vertexArray.Length);
-                offset += vertexDataSize;
-                _geometryAccessor.WriteArray(offset, indexArray, 0, indexArray.Length);
-                offset += indexDataSize;
-                _geometryAccessor.WriteArray(offset, normalArray, 0, normalArray.Length);
-
-                VertexCount = sceneData.VertexCount;
-                TriangleCount = sceneData.TriangleCount;
-                LastCacheTime = DateTime.Now;
-                _isCacheValid = true;
-                
                 string sizeInfo = CacheSizeBytes > 1048576 ? $"{CacheSizeBytes / 1048576.0:F2} MB" : $"{CacheSizeBytes / 1024.0:F2} KB";
                 updateStatusCallback?.Invoke($"Caché generado: {VertexCount:N0} vértices, {TriangleCount:N0} triángulos ({sizeInfo})", Drawing.Color.Green);
             }
@@ -201,30 +179,76 @@ namespace WabiSabiBridge.Extractors.Cache
             }
         }
 
-        private ExtractedSceneData ExtractSceneGeometry(Document doc, View3D view3D, Action<string, Drawing.Color>? updateStatusCallback)
+        // --- MÉTODO MEJORADO DE EXTRACCIÓN CON MEJOR FEEDBACK ---
+        private ExtractedSceneData ExtractSceneGeometry(
+            Document doc, 
+            View3D view3D, 
+            Action<string, Drawing.Color>? updateStatusCallback)
         {
             var sceneData = new ExtractedSceneData();
-            var options = new Options { ComputeReferences = false, DetailLevel = ViewDetailLevel.Fine, IncludeNonVisibleObjects = false };
-            var collector = new FilteredElementCollector(doc, view3D.Id).WhereElementIsNotElementType().Where(e => e.Category != null && e.Category.CategoryType == CategoryType.Model && e.get_Geometry(options) != null);
+            var options = new Options 
+            { 
+                ComputeReferences = false, 
+                DetailLevel = ViewDetailLevel.Fine, 
+                IncludeNonVisibleObjects = false 
+            };
             
-            int totalElements = collector.Count();
+            // Usar un colector más eficiente
+            var collector = new FilteredElementCollector(doc, view3D.Id)
+                .WhereElementIsNotElementType()
+                .Where(e => e.Category != null && 
+                           e.Category.CategoryType == CategoryType.Model && 
+                           e.get_Geometry(options) != null);
+            
+            var elements = collector.ToList();
+            int totalElements = elements.Count;
             int processedElements = 0;
+            int lastReportedProgress = -1;
+            
+            // Procesar en lotes para mejor rendimiento
+            const int batchSize = 50;
+            var batches = elements.Select((element, index) => new { element, index })
+                                 .GroupBy(x => x.index / batchSize)
+                                 .Select(g => g.Select(x => x.element).ToList());
 
-            foreach (var element in collector)
+            foreach (var batch in batches)
             {
-                try
+                foreach (var element in batch)
                 {
-                    var geometry = element.get_Geometry(options);
-                    ExtractGeometryFromElement(geometry, sceneData);
-                    processedElements++;
-                    if (processedElements % 100 == 0)
+                    try
                     {
-                        updateStatusCallback?.Invoke($"Extrayendo geometría: {((float)processedElements / totalElements):P0}", Drawing.Color.Blue);
-                        System.Windows.Forms.Application.DoEvents();
+                        var geometry = element.get_Geometry(options);
+                        if (geometry != null)
+                        {
+                            ExtractGeometryFromElement(geometry, sceneData);
+                        }
+                        processedElements++;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log del error pero continuar con otros elementos
+                        System.Diagnostics.Debug.WriteLine($"Error procesando elemento {element.Id}: {ex.Message}");
                     }
                 }
-                catch { /* Ignorar elementos problemáticos */ }
+
+                // Actualizar progreso solo cuando cambie significativamente
+                int currentProgress = (int)((float)processedElements / totalElements * 100);
+                if (currentProgress > lastReportedProgress && currentProgress % 5 == 0 && totalElements > 0)
+                {
+                    lastReportedProgress = currentProgress;
+                    updateStatusCallback?.Invoke(
+                        $"Extrayendo geometría: {currentProgress}% ({processedElements:N0}/{totalElements:N0} elementos)", 
+                        Drawing.Color.Blue);
+                    
+                    // Permitir que la UI se actualice
+                    System.Windows.Forms.Application.DoEvents();
+                }
             }
+
+            updateStatusCallback?.Invoke(
+                $"Extracción completada: {sceneData.VertexCount:N0} vértices, {sceneData.TriangleCount:N0} triángulos", 
+                Drawing.Color.Green);
+                
             return sceneData;
         }
 
@@ -258,9 +282,8 @@ namespace WabiSabiBridge.Extractors.Cache
         private void AddMeshToSceneData(Mesh mesh, ExtractedSceneData sceneData)
         {
             int baseIndex = sceneData.VertexCount;
-            for (int i = 0; i < mesh.Vertices.Count; i++)
+            foreach (XYZ v in mesh.Vertices)
             {
-                XYZ v = mesh.Vertices[i];
                 sceneData.Vertices.Add((float)v.X);
                 sceneData.Vertices.Add((float)v.Y);
                 sceneData.Vertices.Add((float)v.Z);
@@ -279,10 +302,69 @@ namespace WabiSabiBridge.Extractors.Cache
                 sceneData.Normals.Add(0);
                 sceneData.Normals.Add(1);
             }
-            sceneData.VertexCount += mesh.Vertices.Count;
-            sceneData.TriangleCount += mesh.NumTriangles;
         }
+        
+        // --- NUEVO: MÉTODO MEJORADO PARA ESCRIBIR AL MMF CON VALIDACIÓN ---
+        private void WriteToMemoryMappedFile(ExtractedSceneData sceneData, Action<string, Drawing.Color>? updateStatusCallback)
+        {
+            try
+            {
+                updateStatusCallback?.Invoke("Optimizando datos de geometría...", Drawing.Color.Blue);
+                
+                // Convertir listas a arrays para mejor rendimiento
+                var vertexArray = sceneData.Vertices.ToArray();
+                var indexArray = sceneData.Triangles.ToArray();
+                var normalArray = sceneData.Normals.ToArray();
+                
+                // Calcular tamaños con validación
+                long vertexDataSize = (long)vertexArray.Length * sizeof(float);
+                long indexDataSize = (long)indexArray.Length * sizeof(int);
+                long normalDataSize = (long)normalArray.Length * sizeof(float);
+                CacheSizeBytes = vertexDataSize + indexDataSize + normalDataSize;
 
+                if (CacheSizeBytes == 0)
+                {
+                    // Usa InvalidOperationException que es más apropiado que un simple return.
+                    throw new InvalidOperationException("No se encontró geometría visible para cachear");
+                }
+
+                updateStatusCallback?.Invoke("Creando caché en memoria...", Drawing.Color.Blue);
+                
+                // Crear MMF con un nombre único
+                string mmfName = $"WabiSabi_GeometryCache_{Guid.NewGuid():N}";
+                _geometryMmf = MemoryMappedFile.CreateNew(mmfName, CacheSizeBytes, MemoryMappedFileAccess.ReadWrite);
+                _geometryAccessor = _geometryMmf.CreateViewAccessor();
+                
+                // Escribir en bloques para mostrar progreso
+                const int blockSize = 1024 * 1024; // 1MB blocks
+                long totalBytes = CacheSizeBytes;
+                long bytesWritten = 0;
+                
+                updateStatusCallback?.Invoke("Escribiendo datos al caché...", Drawing.Color.Blue);
+                
+                // Escribir vértices
+                _geometryAccessor.WriteArray(bytesWritten, vertexArray, 0, vertexArray.Length);
+                bytesWritten += vertexDataSize;
+
+                // Escribir índices
+                _geometryAccessor.WriteArray(bytesWritten, indexArray, 0, indexArray.Length);
+                bytesWritten += indexDataSize;
+
+                // Escribir normales
+                _geometryAccessor.WriteArray(bytesWritten, normalArray, 0, normalArray.Length);
+
+                VertexCount = sceneData.VertexCount;
+                TriangleCount = sceneData.TriangleCount;
+                LastCacheTime = DateTime.Now;
+                _isCacheValid = true;
+            }
+            catch (Exception ex)
+            {
+                DisposeCurrentCache();
+                throw new Exception($"Error al crear caché de geometría: {ex.Message}", ex);
+            }
+        }
+        
         public void InvalidateCache()
         {
             System.Diagnostics.Debug.WriteLine("GeometryCacheManager: Caché invalidado manualmente");
@@ -295,9 +377,50 @@ namespace WabiSabiBridge.Extractors.Cache
             return total > 0 ? (double)_cacheHits / total : 0;
         }
 
-        public string GetPerformanceStats()
+        // --- NUEVO: MÉTODO PARA OBTENER ESTADÍSTICAS DEL CACHÉ ---
+        public CacheStatistics GetStatistics()
         {
-            return $"Stats - Hits: {_cacheHits}, Misses: {_cacheMisses}, Rate: {GetHitRate():P1}, Avg.Ext.Time: {(_cacheMisses > 0 ? _totalExtractionTime.TotalSeconds / _cacheMisses : 0):F1}s";
+            return new CacheStatistics
+            {
+                IsValid = IsCacheValid,
+                VertexCount = VertexCount,
+                TriangleCount = TriangleCount,
+                SizeInBytes = CacheSizeBytes,
+                LastCacheTime = LastCacheTime,
+                CacheHits = _cacheHits,
+                CacheMisses = _cacheMisses,
+                HitRate = GetHitRate(),
+                TotalExtractionTime = _totalExtractionTime,
+                AverageExtractionTime = _cacheMisses > 0 ? 
+                    TimeSpan.FromMilliseconds(_totalExtractionTime.TotalMilliseconds / _cacheMisses) : 
+                    TimeSpan.Zero
+            };
+        }
+
+        // --- NUEVO: MÉTODO PARA PRE-CALENTAR EL CACHÉ (ÚTIL AL INICIAR) ---
+        public async Task WarmUpCacheAsync(Document doc, View3D view3D, 
+            IProgress<string>? progress = null,
+            CancellationToken cancellationToken = default)
+        {
+            await Task.Run(() =>
+            {
+                Action<string, Drawing.Color>? progressCallback = null;
+                if (progress != null)
+                {
+                    progressCallback = (msg, color) => progress.Report(msg);
+                }
+
+                try
+                {
+                    progress?.Report("Iniciando pre-calentamiento del caché...");
+                    EnsureCacheIsValid(doc, view3D, progressCallback);
+                    progress?.Report("Caché pre-calentado exitosamente");
+                }
+                catch (Exception ex)
+                {
+                    progress?.Report($"Error en pre-calentamiento: {ex.Message}");
+                }
+            }, cancellationToken);
         }
 
         private void DisposeCurrentCache()
@@ -311,27 +434,73 @@ namespace WabiSabiBridge.Extractors.Cache
 
         public void Dispose()
         {
-            System.Diagnostics.Debug.WriteLine($"GeometryCacheManager: Disposing. {GetPerformanceStats()}");
+            System.Diagnostics.Debug.WriteLine($"GeometryCacheManager: Disposing. {GetStatistics()}");
             DisposeCurrentCache();
-        }
-        
-        private class ExtractedSceneData
-        {
-            public List<float> Vertices { get; set; } = new List<float>();
-            public List<int> Triangles { get; set; } = new List<int>();
-            public List<float> Normals { get; set; } = new List<float>();
-            public int VertexCount { get; set; } = 0;
-            public int TriangleCount { get; set; } = 0;
         }
     }
     
-    public class CachedGeometryData
+    // --- NUEVO: CLASE PARA ESTADÍSTICAS DEL CACHÉ ---
+    public class CacheStatistics
     {
-        public MemoryMappedFile GeometryMmf { get; set; } = null!;
+        public bool IsValid { get; set; }
+        public int VertexCount { get; set; }
+        public int TriangleCount { get; set; }
+        public long SizeInBytes { get; set; }
+        public DateTime LastCacheTime { get; set; }
+        public int CacheHits { get; set; }
+        public int CacheMisses { get; set; }
+        public double HitRate { get; set; }
+        public TimeSpan TotalExtractionTime { get; set; }
+        public TimeSpan AverageExtractionTime { get; set; }
+
+        public string GetFormattedSize()
+        {
+            if (SizeInBytes < 1024)
+                return $"{SizeInBytes} B";
+            if (SizeInBytes < 1024 * 1024)
+                return $"{SizeInBytes / 1024.0:F1} KB";
+            if (SizeInBytes < 1024 * 1024 * 1024)
+                return $"{SizeInBytes / (1024.0 * 1024.0):F1} MB";
+            return $"{SizeInBytes / (1024.0 * 1024.0 * 1024.0):F1} GB";
+        }
+
+        public override string ToString()
+        {
+            return $"Caché {(IsValid ? "Válido" : "Inválido")} - " +
+                   $"{VertexCount:N0} vértices, {TriangleCount:N0} triángulos ({GetFormattedSize()}) - " +
+                   $"Hit Rate: {HitRate:P1} ({CacheHits} hits, {CacheMisses} misses) - " +
+                   $"Tiempo promedio: {AverageExtractionTime.TotalSeconds:F1}s";
+        }
+    }
+    
+    // --- ACTUALIZADO: ESTRUCTURA DE DATOS DEL CACHÉ CON TODA LA INFORMACIÓN NECESARIA ---
+    public struct CachedGeometryData
+    {
+        public MemoryMappedFile? GeometryMmf { get; set; }
         public int VertexCount { get; set; }
         public int TriangleCount { get; set; }
         public long VerticesOffset { get; set; }
         public long IndicesOffset { get; set; }
         public long NormalsOffset { get; set; }
+        
+        public bool IsValid => GeometryMmf != null && VertexCount > 0 && TriangleCount > 0;
+    }
+
+    // --- ACTUALIZADO: DATOS EXTRAÍDOS DE LA ESCENA ---
+    public class ExtractedSceneData
+    {
+        public List<float> Vertices { get; } = new List<float>();
+        public List<int> Triangles { get; } = new List<int>();
+        public List<float> Normals { get; } = new List<float>();
+        
+        public int VertexCount => Vertices.Count / 3;
+        public int TriangleCount => Triangles.Count / 3;
+        
+        public void Clear()
+        {
+            Vertices.Clear();
+            Triangles.Clear();
+            Normals.Clear();
+        }
     }
 }
