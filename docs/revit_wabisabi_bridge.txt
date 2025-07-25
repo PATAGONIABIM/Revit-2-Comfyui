@@ -12,7 +12,7 @@ El plugin operará en tres modos: **Modo Manual** para actualizaciones precisas 
 
 ### Tecnologías y Prerrequisitos:
 
-- **Lenguaje**: C# (.NET Framework 4.8)
+- **Lenguaje**: C# (.NET Framework 8.0)
 - **IDE**: Visual Studio 2022
 - **API de Revit**: 2026 o posterior
 - **Librerías adicionales**:

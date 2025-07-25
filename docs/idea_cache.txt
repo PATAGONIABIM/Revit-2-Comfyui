@@ -19,7 +19,7 @@ Esto es el "Camino Rápido" y es el que usarás el 99% del tiempo.
 ¿Cómo funciona?: Cuando mueves la cámara en Revit (orbitas, haces zoom) y exportas de nuevo, el plugin hace lo siguiente:
 Detecta que el "set" (el caché de geometría) ya está montado y es válido.
 Se salta por completo el costoso proceso de montaje.
-Obtiene la nueva posición de tu cámara (una operación muy rápida).
+Obtiene las nuevas posiciones de tu cámara en tiempo real (una operación muy rápida).
 Le dice a la GPU: "Usa el set que ya tienes preparado y saca la foto desde esta nueva posición".
 El Resultado: La GPU genera el mapa de profundidad casi instantáneamente, porque toda la información pesada ya estaba en su memoria, lista para ser usada.
 Pilar 3: La Invalidación Inteligente (Saber Cuándo hay que Reajustar el Set)

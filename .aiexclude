@@ -4,5 +4,5 @@
 **/.vs
 
 # Excluir documentación y propiedades
-**/docs
+
 **/properties

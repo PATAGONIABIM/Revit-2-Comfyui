@@ -151,17 +151,21 @@ namespace WabiSabiBridge.Extractors.Cache
                 updateStatusCallback?.Invoke("Extrayendo geometría del modelo...", Drawing.Color.Blue);
                 var sceneData = ExtractSceneGeometry(doc, view3D, updateStatusCallback);
                 
-                if (sceneData.TriangleCount == 0)
-                {
-                    updateStatusCallback?.Invoke("Advertencia: No se encontró geometría visible para cachear.", Drawing.Color.Orange);
-                    _isCacheValid = false;
-                    return;
-                }
-                
+                // --- INICIO DE LA CORRECCIÓN ---
+                // 1. Calcular el tamaño primero
                 long vertexDataSize = (long)sceneData.Vertices.Count * sizeof(float);
                 long indexDataSize = (long)sceneData.Triangles.Count * sizeof(int);
                 long normalDataSize = (long)sceneData.Normals.Count * sizeof(float);
                 CacheSizeBytes = vertexDataSize + indexDataSize + normalDataSize;
+
+                // 2. Comprobar si el tamaño es cero ANTES de crear el MMF
+                if (CacheSizeBytes == 0)
+                {
+                    updateStatusCallback?.Invoke("Advertencia: No se encontró geometría visible para cachear.", Drawing.Color.Orange);
+                    _isCacheValid = false;
+                    return; // Salir de forma segura
+                }
+                // --- FIN DE LA CORRECCIÓN ---
                 
                 string mmfName = $"WabiSabi_GeometryCache_{Guid.NewGuid():N}";
                 _geometryMmf = MemoryMappedFile.CreateNew(mmfName, CacheSizeBytes, MemoryMappedFileAccess.ReadWrite);

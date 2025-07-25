@@ -72,7 +72,7 @@ namespace WabiSabiBridge.Extractors
             }
         }
         
-        public double[,] ExtractDepthMap(View3D view3D, int width, int height, IList<XYZ> viewCorners)
+        public void ExtractDepthMap(View3D view3D, int width, int height, IList<XYZ> viewCorners, string outputPath, string timestamp)
         {
             Document doc = _uiApp.ActiveUIDocument.Document;
             
@@ -102,7 +102,7 @@ namespace WabiSabiBridge.Extractors
             double minDepth = 0.1;
             double maxDepth = CalculateMaxDepth(view3D, eyePosition, forwardDirection, viewCenter);
 
-            System.Diagnostics.Debug.WriteLine($"=== WabiSabi Depth Debug (GPU Optimized) ===");
+            System.Diagnostics.Debug.WriteLine("=== WabiSabi Depth Debug (GPU Optimized) ===");
             System.Diagnostics.Debug.WriteLine($"View Type: {(view3D.IsPerspective ? "Perspective" : "Orthographic")}");
             System.Diagnostics.Debug.WriteLine($"Resolution: {width}x{height}");
             System.Diagnostics.Debug.WriteLine($"Depth Range: {minDepth:F2} to {maxDepth:F2}");
@@ -132,8 +132,8 @@ namespace WabiSabiBridge.Extractors
             }
             
             // Generar imagen (paralelo)
+            GenerateDepthImage(depthData, width, height, outputPath, timestamp);
             System.Diagnostics.Debug.WriteLine("=== End WabiSabi Depth Debug ===");
-            return depthData;
         }
         
         /// <summary>

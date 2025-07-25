@@ -18,7 +18,7 @@
 
 ## Directorios y archivos específicos del proyecto solicitados
 # Carpetas de documentación y configuración del proyecto que no deseas versionar.
-docs/
+
 properties/
 
 ## Archivos de paquetes NuGet

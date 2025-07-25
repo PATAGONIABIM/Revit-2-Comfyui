@@ -1,0 +1,99 @@
+Real Time Link.
+
+El Plan de Batalla: Arquitectura para un Vínculo en Tiempo Real
+Nuestro objetivo es lograr que la GPU renderice lo que Revit ve, pero a una velocidad de fotogramas altísima (60 FPS o más). Para esto, es imposible que Revit realice la exportación de imágenes en cada fotograma. En su lugar, implementaremos una arquitectura profesional de Productor/Consumidor utilizando dos procesos separados que se comunican a través de memoria compartida.
+1. El Productor (El Add-in de Revit):
+Misión: Su única tarea será capturar la información esencial de la cámara (posición, rotación, lente) de la forma más rápida y ligera posible y escribirla en una ubicación de memoria compartida. Debe tener un impacto casi nulo en el rendimiento de Revit.
+2. El Consumidor (La Aplicación GPU):
+Misión: Será una aplicación independiente (por ejemplo, en Unity o Unreal Engine) que ya tiene la geometría del modelo cargada. Su única tarea será leer la memoria compartida constantemente, actualizar su propia cámara para que coincida con la de Revit y usar la GPU para renderizar la escena desde esa perspectiva. Esto le permitirá generar instantáneamente mapas de profundidad, normales, líneas y cualquier otro efecto visual.
+Esta separación es la clave para la fluidez: Revit se encarga de los datos BIM y la cámara; la GPU se encarga del renderizado pesado.
+Fase 1: Desarrollar el Productor (El Add-in de Revit)
+Aquí están los pasos para construir el componente dentro de Revit.
+Paso 1.1: Definir el Paquete de Datos (struct de Cámara)
+Necesitamos un "paquete" de datos estandarizado y ultra-eficiente para enviar a la GPU. Usaremos un struct de C# con un layout de memoria secuencial, lo que garantiza que los datos se escriban y lean como un bloque de bytes predecible.
+Crea esta nueva struct en tu archivo WabiSabiBridge.cs:
+Generated csharp
+using System.Runtime.InteropServices;
+
+[StructLayout(LayoutKind.Sequential)] // Garantiza un orden de memoria predecible
+public struct SerializableCameraState
+{
+    // Orientación de la cámara
+    public float EyePosX, EyePosY, EyePosZ;
+    public float ForwardX, ForwardY, ForwardZ;
+    public float UpX, UpY, UpZ;
+    public float RightX, RightY, RightZ; // Pre-calculado para conveniencia
+
+    // Parámetros de la lente (Proyección)
+    public float FieldOfView; // Campo de visión vertical en grados
+    public float AspectRatio;
+    public float NearClipPlane;
+    public float FarClipPlane;
+
+    // Sincronización
+    public long SequenceNumber; // Un contador para que el consumidor sepa si hay un fotograma nuevo
+}
+Use code with caution.
+C#
+Paso 1.2: Implementar el Motor de Captura (Forms.Timer)
+Para capturar la cámara de forma constante sin depender de los eventos de Revit, usaremos un System.Windows.Forms.Timer. Este se ejecutará en el hilo de la interfaz de usuario, dándonos acceso seguro a la API de Revit.
+En la clase WabiSabiBridgeApp, define el timer y su evento Tick:
+Se iniciará cuando el usuario active el modo de "Exportación automática".
+Tendrá un intervalo de 16 milisegundos, lo que equivale a ~62.5 FPS.
+Paso 1.3: Implementar la Lógica de Captura y Escritura
+El evento Tick del timer será el corazón de nuestro extractor. En cada tick, realizará las siguientes operaciones ultra-rápidas:
+Obtener Datos de Revit: Capturar la orientación de la cámara y las esquinas de la vista.
+Realizar Cálculos Esenciales:
+Calcular el Aspect Ratio (relación de aspecto) a partir de las dimensiones de la ventana de la vista.
+Calcular el Campo de Visión Vertical (FoV). Revit no lo proporciona directamente, por lo que lo derivaremos usando trigonometría a partir de la altura de la vista y la distancia a la cámara.
+Poblar el struct: Llenar una instancia de SerializableCameraState con todos los datos calculados.
+Escribir en Memoria: Usar un Fichero Mapeado en Memoria (MMF) para escribir el struct en una sección de la RAM compartida. Esta operación es casi instantánea y no involucra el disco duro.
+Ejemplo de la lógica dentro del Tick del timer:
+Generated csharp
+private static void DirectCaptureTimer_Tick(object? sender, EventArgs e)
+{
+    // ... (comprobaciones de que la vista 3D está activa) ...
+
+    var orientation = view3D.GetOrientation();
+    var corners = uiView.GetZoomCorners();
+    var viewRect = uiView.GetWindowRectangle();
+
+    // Calcular parámetros
+    float aspectRatio = (float)viewRect.Width / viewRect.Height;
+    XYZ viewCenter = (corners[0] + corners[1]) / 2.0;
+    double distToPlane = (viewCenter - orientation.EyePosition).DotProduct(orientation.ForwardDirection);
+    double viewHeight = Math.Abs((corners[0] - corners[1]).DotProduct(orientation.UpDirection));
+    float verticalFov = (float)(2.0 * Math.Atan(viewHeight / (2.0 * distToPlane)) * (180.0 / Math.PI));
+
+    // Llenar el paquete de datos
+    var state = new SerializableCameraState
+    {
+        EyePosX = (float)orientation.EyePosition.X, /* ...y el resto... */
+        FieldOfView = verticalFov,
+        AspectRatio = aspectRatio,
+        NearClipPlane = 0.1f,
+        FarClipPlane = 1000f,
+        SequenceNumber = Interlocked.Increment(ref _globalSequenceNumber)
+    };
+    
+    // Escribir en la memoria compartida (operación de nanosegundos)
+    _cameraAccessor?.Write(0, ref state);
+}
+Use code with caution.
+C#
+Fase 2: Desarrollar el Consumidor (La Aplicación GPU)
+Esta es una aplicación separada que se conecta a Revit.
+Paso 2.1: Cargar la Geometría
+Al iniciar la conexión, el primer paso es que el add-in de Revit realice una exportación única de toda la geometría visible en la vista 3D a un formato estándar como glTF o FBX. La aplicación GPU cargará este modelo una vez y lo mantendrá en la memoria de la tarjeta gráfica.
+Paso 2.2: Conectarse a la Memoria Compartida
+La aplicación GPU se iniciará y abrirá el mismo Fichero Mapeado en Memoria ("WabiSabiBridge_CameraStream") que Revit está usando para escribir.
+Paso 2.3: Implementar el Bucle de Renderizado
+En su bucle principal (el "Game Loop"), la aplicación GPU hará lo siguiente en cada fotograma:
+Leer de Memoria: Lee el struct SerializableCameraState desde el MMF.
+Verificar Novedad: Compara el SequenceNumber leído con el último que ha procesado. Si es mayor, procede a actualizar.
+Actualizar la Cámara Virtual: Usa los datos del struct (posición, vectores, FoV, aspect ratio) para configurar su propia cámara 3D. Esto se hace creando una Matriz de Vista y una Matriz de Proyección y pasándoselas a la GPU.
+Renderizar: La GPU, ahora con la cámara en la posición correcta, renderiza la geometría que ya tiene en memoria. Usando técnicas de Renderizado Diferido (Deferred Rendering), puede generar en una sola pasada múltiples texturas (G-Buffer) que contienen:
+El mapa de profundidad (del Z-Buffer).
+El mapa de normales.
+El color base y otros datos de materiales.
+Con estos "buffers" llenos, se pueden aplicar efectos de post-procesado, como la detección de bordes para las líneas, de forma casi instantánea.

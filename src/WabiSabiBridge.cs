@@ -154,8 +154,8 @@ namespace WabiSabiBridge
         public bool SaveTimestampedRender { get; set; }
         public bool SaveTimestampedDepth { get; set; }
 
-        private DepthExtractor? _depthExtractor;
-        private DepthExtractorFast? _depthExtractorFast;
+        private DepthExtractor? _depthExtractor = null;
+        private DepthExtractorFast? _depthExtractorFast = null;
         // CAMBIO: El tipo de campo se cambia a la clase concreta para mejorar el rendimiento al evitar la indirección de la interfaz.
         private GpuAccelerationManager? _gpuManager;
         
@@ -213,9 +213,70 @@ namespace WabiSabiBridge
                             // Lógica reconstruida para el modo experimental
                             var cacheManager = GeometryCacheManager.Instance;
                             var cachedData = cacheManager.EnsureCacheIsValid(doc, view3D, UpdateStatusCallback);
+                            if (!cacheManager.IsCacheValid || cachedData.TriangleCount == 0)
+                            {
+                                WabiSabiLogger.Log("Caché de geometría no válido o vacío. Saltando ray-tracing en GPU para modo experimental.", LogLevel.Warning);
+                                depthData = new double[targetHeight, targetWidth]; // Asignar un mapa de profundidad vacío.
+                            }
+                            else
+                            {
                             var eyePosition = view3D.GetOrientation().EyePosition;
-                            // ... (resto de tu lógica para calcular los vectores y la configuración de RayTracingConfig) ...
-                            var config = new RayTracingConfig { /* ... tu configuración ... */ };
+
+                            // --- LÓGICA DE CONFIGURACIÓN DE RAYTRACING ---
+                            // Obtener los vectores de la cámara tal como los necesita el shader.
+                            // El shader calcula la dirección de cada rayo interpolando desde la esquina inferior izquierda.
+                            XYZ bottomLeft = viewCorners[0];
+                            XYZ topRight = viewCorners[1];
+                            
+                            var camOrientation = view3D.GetOrientation();
+                            var upDir = camOrientation.UpDirection.Normalize();
+                            var rightDir = camOrientation.ForwardDirection.CrossProduct(upDir).Normalize();
+
+                            // Calcular el vector que representa el ancho total y la altura total de la vista.
+                            XYZ viewWidthVec = (topRight - bottomLeft).DotProduct(rightDir) * rightDir;
+                            XYZ viewHeightVec = (topRight - bottomLeft).DotProduct(upDir) * upDir;
+                            
+                            // Calcular el rango de profundidad (min/max).
+                            double minDepth = 0.1;
+                            double maxDepth;
+                            if (AutoDepthRange)
+                            {
+                                // Lógica de cálculo de profundidad automática (simplificada de otras partes del código)
+                                double distanceToTarget = -1.0;
+                                if (view3D.CropBox.Enabled)
+                                {
+                                    var cropCenter = (view3D.CropBox.Min + view3D.CropBox.Max) / 2.0;
+                                    double distanceAlongView = (cropCenter - eyePosition).DotProduct(camOrientation.ForwardDirection);
+                                    if (distanceAlongView > 0) distanceToTarget = distanceAlongView;
+                                }
+                                maxDepth = distanceToTarget > 0 ? distanceToTarget * 1.2 : 100.0;
+                            }
+                            else
+                            {
+                                maxDepth = DepthRangeDistance;
+                            }
+
+                            // Crear y poblar la configuración para la GPU.
+                            var config = new RayTracingConfig
+                            {
+                                EyePosition = new ComputeSharp.Float3((float)eyePosition.X, (float)eyePosition.Y, (float)eyePosition.Z),
+                                
+                                // ViewDirection en el shader es el vector desde el ojo a la esquina inferior izquierda.
+                                ViewDirection = new ComputeSharp.Float3(
+                                    (float)(bottomLeft.X - eyePosition.X),
+                                    (float)(bottomLeft.Y - eyePosition.Y),
+                                    (float)(bottomLeft.Z - eyePosition.Z)
+                                ),
+                                // RightDirection en el shader es el vector que abarca el ancho de la vista.
+                                RightDirection = new ComputeSharp.Float3((float)viewWidthVec.X, (float)viewWidthVec.Y, (float)viewWidthVec.Z),
+                                // UpDirection en el shader es el vector que abarca la altura de la vista.
+                                UpDirection = new ComputeSharp.Float3((float)viewHeightVec.X, (float)viewHeightVec.Y, (float)viewHeightVec.Z),
+                                
+                                Width = targetWidth,
+                                Height = targetHeight,
+                                MinDepth = (float)minDepth,
+                                MaxDepth = (float)maxDepth
+                            };
                             
                             var depthTask = Task.Run(async () => await _gpuManager.ExecuteDepthRayTracingFromCacheAsync(
                                 cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config));
@@ -225,6 +286,7 @@ namespace WabiSabiBridge
                             Parallel.For(0, targetHeight, y => {
                                 for (int x = 0; x < targetWidth; x++) depthData[y, x] = gpuDepthBuffer[y * targetWidth + x];
                             });
+                            }
                         }
                         else
                         {
@@ -236,6 +298,7 @@ namespace WabiSabiBridge
                                 _depthExtractorFast.ManualDepthDistance = this.DepthRangeDistance;
                                 _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
                                 depthData = _depthExtractorFast.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners);
+                                WabiSabiLogger.Log($"DepthData (Rápida) dimensions: {depthData?.GetLength(0)}x{depthData?.GetLength(1)}", LogLevel.Debug);
                             }
                             else if (DepthQuality == 2) // Alta
                             {
@@ -244,7 +307,8 @@ namespace WabiSabiBridge
                                 _depthExtractor.ManualDepthDistance = this.DepthRangeDistance;
                                 _depthExtractor.UseGpuAcceleration = this.UseGpuAcceleration;
                                 _depthExtractor.UseGeometryExtraction = this.UseGeometryExtraction;
-                                depthData = _depthExtractor.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners);
+                                _depthExtractor.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners, this.OutputPath, timestamp);
+                                depthData = null; // La imagen se guarda directamente en el extractor
                             }
                             else // Normal
                             {
@@ -253,6 +317,7 @@ namespace WabiSabiBridge
                                 _depthExtractorFast.ManualDepthDistance = this.DepthRangeDistance;
                                 _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
                                 depthData = _depthExtractorFast.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners);
+                                WabiSabiLogger.Log($"DepthData (Normal) dimensions: {depthData?.GetLength(0)}x{depthData?.GetLength(1)}", LogLevel.Debug);
                             }
                         }
                     }
@@ -285,7 +350,8 @@ namespace WabiSabiBridge
                     ProjectName = doc.Title,
                     ProjectPath = doc.PathName,
                     GpuAccelerated = this.UseGpuAcceleration,
-                    DepthData = depthData // <-- ¡Adjuntamos el resultado del cálculo!
+                    DepthData = depthData, // <-- ¡Adjuntamos el resultado del cálculo!
+                    EventHandler = this // Asignamos la instancia actual de ExportEventHandler
                 };
 
                 WabiSabiBridgeApp._exportQueue.Enqueue(job);
@@ -336,6 +402,11 @@ namespace WabiSabiBridge
             {
                 g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
                 g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+                // --- ACTIVAR ANTI-ALIASING ---
+                // Esta es la línea clave que suaviza los bordes de líneas y curvas.
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
                 
                 Drawing.Rectangle sourceRect = isCropActive
                     ? new Drawing.Rectangle(
@@ -368,7 +439,7 @@ namespace WabiSabiBridge
         {
             WabiSabiLogger.LogDiagnostic("Export", "Exportando metadata...");
 
-            // --- INICIO DE LA CORRECCIÓN ---
+            
             // Obtenemos la orientación real de la cámara en el momento de la exportación.
             var orientation = view3D.GetOrientation();
             var eyePos = orientation.EyePosition;
@@ -376,7 +447,7 @@ namespace WabiSabiBridge
             // El "target" se puede calcular proyectando un punto a lo largo de la dirección de la vista.
             var targetPos = eyePos + forwardDir.Multiply(10); // Distancia arbitraria de 10 unidades
             var upVec = orientation.UpDirection;
-            // --- FIN DE LA CORRECCIÓN ---
+            
             
             var metadata = new {
                 timestamp,
@@ -393,7 +464,7 @@ namespace WabiSabiBridge
                     target_position = new { x = targetPos.X, y = targetPos.Y, z = targetPos.Z },
                     up_vector = new { x = upVec.X, y = upVec.Y, z = upVec.Z }
                 },
-                // --- FIN DE LA CORRECCIÓN ---
+                
 
                 project_info = new { name = doc.Title, path = doc.PathName },
                 gpu_acceleration = UseGpuAcceleration
@@ -408,6 +479,39 @@ namespace WabiSabiBridge
             WabiSabiLogger.LogDiagnostic("Export", "Creando archivo de notificación...");
             File.WriteAllText(Path.Combine(outputPath, "last_update.txt"), timestamp);
             WabiSabiLogger.Log("Archivo de notificación creado", LogLevel.Debug);
+        }
+
+        public void Dispose() { _depthExtractor?.Dispose(); _depthExtractorFast?.Dispose(); }
+        
+        // NUEVO MÉTODO: Genera y guarda la imagen de profundidad
+        public void GenerateDepthImage(double[,] depthData, int width, int height, string outputPath, string timestamp, bool saveTimestampedDepth)
+        {
+            using var depthMap = new Drawing.Bitmap(width, height, PixelFormat.Format24bppRgb);
+            BitmapData bmpData = depthMap.LockBits(new Drawing.Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, depthMap.PixelFormat);
+            unsafe
+            {
+                byte* ptr = (byte*)bmpData.Scan0;
+                Parallel.For(0, height, y => {
+                    byte* row = ptr + (y * bmpData.Stride);
+                    for (int x = 0; x < width; x++) {
+                        byte depthValue = (byte)(Math.Max(0.0, Math.Min(1.0, depthData[y, x])) * 255);
+                        row[x * 3] = depthValue; row[x * 3 + 1] = depthValue; row[x * 3 + 2] = depthValue;
+                    }
+                });
+            }
+            depthMap.UnlockBits(bmpData);
+
+            var encoderParams = new EncoderParameters(1) { Param = { [0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 90L) } };
+            var pngCodec = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == System.Drawing.Imaging.ImageFormat.Png.Guid);
+            
+            string currentDepthPath = Path.Combine(outputPath, "current_depth.png");
+            depthMap.Save(currentDepthPath, pngCodec, encoderParams);
+
+            if (saveTimestampedDepth) 
+            {
+                depthMap.Save(Path.Combine(outputPath, $"depth_{timestamp}.png"), pngCodec, encoderParams);
+            }
+            WabiSabiLogger.Log($"Mapa de profundidad guardado: {currentDepthPath}", LogLevel.Debug);
         }
         
         private double CalculateMaxDepth(View3D view3D, XYZ eyePosition, XYZ forwardDirection, XYZ viewCenter)
@@ -434,10 +538,8 @@ namespace WabiSabiBridge
         
 
         public string GetName() => "WabiSabi Bridge Export Event";
-        public void Dispose() { _depthExtractor?.Dispose(); _depthExtractorFast?.Dispose(); }
+        
     }
-    
-    /// <summary>
     /// Ventana principal del plugin
     /// </summary>
     public class WabiSabiBridgeWindow : WinForms.Form
@@ -821,7 +923,7 @@ namespace WabiSabiBridge
                         if (job.DepthData != null)
                         {
                             WabiSabiLogger.Log("Procesando datos de profundidad...", LogLevel.Debug);
-                            GenerateDepthImage(job.DepthData, job.TargetWidth, job.TargetHeight, job.FinalOutputPath, job.Timestamp, job.SaveTimestampedDepth);
+                            job.EventHandler?.GenerateDepthImage(job.DepthData, job.TargetWidth, job.TargetHeight, job.FinalOutputPath, job.Timestamp, job.SaveTimestampedDepth);
                             WabiSabiLogger.Log("Imagen de profundidad guardada.", LogLevel.Debug);
                         }
 
@@ -869,35 +971,7 @@ namespace WabiSabiBridge
             }
         }
 
-         private static void GenerateDepthImage(double[,] depthData, int width, int height, string outputPath, string timestamp, bool saveTimestampedDepth)
-        {
-            using var depthMap = new Drawing.Bitmap(width, height, PixelFormat.Format24bppRgb);
-            BitmapData bmpData = depthMap.LockBits(new Drawing.Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, depthMap.PixelFormat);
-            unsafe
-            {
-                byte* ptr = (byte*)bmpData.Scan0;
-                Parallel.For(0, height, y => {
-                    byte* row = ptr + (y * bmpData.Stride);
-                    for (int x = 0; x < width; x++) {
-                        byte depthValue = (byte)(Math.Max(0.0, Math.Min(1.0, depthData[y, x])) * 255);
-                        row[x * 3] = depthValue; row[x * 3 + 1] = depthValue; row[x * 3 + 2] = depthValue;
-                    }
-                });
-            }
-            depthMap.UnlockBits(bmpData);
-
-            var encoderParams = new EncoderParameters(1) { Param = { [0] = new EncoderParameter(System.Drawing.Imaging.Encoder.Quality, 90L) } };
-            var pngCodec = ImageCodecInfo.GetImageEncoders().First(c => c.FormatID == System.Drawing.Imaging.ImageFormat.Png.Guid);
-            
-            string currentDepthPath = Path.Combine(outputPath, "current_depth.png");
-            depthMap.Save(currentDepthPath, pngCodec, encoderParams);
-
-            if (saveTimestampedDepth) 
-            {
-                depthMap.Save(Path.Combine(outputPath, $"depth_{timestamp}.png"), pngCodec, encoderParams);
-            }
-            WabiSabiLogger.Log($"Mapa de profundidad guardado: {currentDepthPath}", LogLevel.Debug);
-        }
+        public string GetName() => "WabiSabi Bridge Export Event";
         
 
         /// <summary>
@@ -1546,7 +1620,7 @@ namespace WabiSabiBridge
                         TriggerAutoExport();
                         
                         // Reiniciamos los timestamps para evitar exportaciones múltiples.
-                        _lastCameraMoveTimestamp = 0;
+                        //_lastCameraMoveTimestamp = 0;
                         _lastExportTimestamp = now;
                     }
                 }
@@ -2020,7 +2094,6 @@ namespace WabiSabiBridge
             
             return result;
         }
-
         
     }
     
@@ -2322,51 +2395,54 @@ namespace WabiSabiBridge
         {
             return $"WabiSabiConfig: AutoExport={AutoExport}, DepthRes={DepthResolution}, GPU={UseGpuAcceleration}, Path='{OutputPath}'";
         }
-}
-        /// <summary>
-        /// Contiene toda la información necesaria para procesar una exportación en un hilo secundario.
-        /// </summary>
-        public class ExportJob
-        {
-            // Datos de la imagen
-            public string TempRenderPath { get; set; } = string.Empty;
-            public int TargetWidth { get; set; }
-            public int TargetHeight { get; set; }
-
-            // Datos de recorte
-            public bool IsCropActive { get; set; }
-            public double OutlineMinU { get; set; }
-            public double OutlineMinV { get; set; }
-            public double OutlineMaxU { get; set; }
-            public double OutlineMaxV { get; set; }
-            
-            // Datos de guardado
-            public string FinalOutputPath { get; set; } = string.Empty;
-            public string Timestamp { get; set; } = string.Empty;
-            public bool SaveTimestampedRender { get; set; }
-            public bool SaveTimestampedDepth { get; set; }
-
-            // Datos para Metadata
-            public string ViewName { get; set; } = string.Empty;
-            public int ViewScale { get; set; }
-            public string DetailLevel { get; set; } = string.Empty;
-            public string DisplayStyle { get; set; } = string.Empty;
-            public double CamEyeX { get; set; }
-            public double CamEyeY { get; set; }
-            public double CamEyeZ { get; set; }
-            public double CamForwardX { get; set; }
-            public double CamForwardY { get; set; }
-            public double CamForwardZ { get; set; }
-            public double CamUpX { get; set; }
-            public double CamUpY { get; set; }
-            public double CamUpZ { get; set; }
-            public string ProjectName { get; set; } = string.Empty;
-            public string ProjectPath { get; set; } = string.Empty;
-            public bool GpuAccelerated { get; set; }
-            public double[,]? DepthData { get; set; }
-        }
+        
 
     
 
     #endregion
+    }
+
+    /// <summary>
+    /// Contiene toda la información necesaria para procesar una exportación en un hilo secundario.
+    /// </summary>
+    public class ExportJob
+    {
+        // Datos de la imagen
+        public string TempRenderPath { get; set; } = string.Empty;
+        public int TargetWidth { get; set; }
+        public int TargetHeight { get; set; }
+
+        // Datos de recorte
+        public bool IsCropActive { get; set; }
+        public double OutlineMinU { get; set; }
+        public double OutlineMinV { get; set; }
+        public double OutlineMaxU { get; set; }
+        public double OutlineMaxV { get; set; }
+        
+        // Datos de guardado
+        public string FinalOutputPath { get; set; } = string.Empty;
+        public string Timestamp { get; set; } = string.Empty;
+        public bool SaveTimestampedRender { get; set; }
+        public bool SaveTimestampedDepth { get; set; }
+
+        // Datos para Metadata
+        public string ViewName { get; set; } = string.Empty;
+        public int ViewScale { get; set; }
+        public string DetailLevel { get; set; } = string.Empty;
+        public string DisplayStyle { get; set; } = string.Empty;
+        public double CamEyeX { get; set; }
+        public double CamEyeY { get; set; }
+        public double CamEyeZ { get; set; }
+        public double CamForwardX { get; set; }
+        public double CamForwardY { get; set; }
+        public double CamForwardZ { get; set; }
+        public double CamUpX { get; set; }
+        public double CamUpY { get; set; }
+        public double CamUpZ { get; set; }
+        public string ProjectName { get; set; } = string.Empty;
+        public string ProjectPath { get; set; } = string.Empty;
+        public bool GpuAccelerated { get; set; }
+        public double[,]? DepthData { get; set; }
+        public ExportEventHandler? EventHandler { get; set; }
+    }
 }
