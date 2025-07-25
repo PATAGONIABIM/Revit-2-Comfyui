@@ -60,6 +60,26 @@ namespace WabiSabiBridge.Extractors.Gpu
                 System.Diagnostics.Debug.WriteLine($"Error escribiendo a MMF: {ex.Message}");
             }
         }
+
+        /// <summary>
+        /// Implementación de respaldo para el renderizado de líneas. No está soportado en el modo simple,
+        /// por lo que devuelve una imagen vacía para evitar que la aplicación se bloquee.
+        /// </summary>
+        public Task<float[]> ExecuteLineRenderAsync(MemoryMappedFile cacheFile, int vertexCount, int triangleCount, RayTracingConfig config)
+        {
+            // Advertir al desarrollador que este modo no está soportado.
+            System.Diagnostics.Debug.WriteLine("ADVERTENCIA: GpuAccelerationSimple (CPU Fallback) no soporta el renderizado de líneas. Se devolverá una imagen vacía.");
+            
+            // Crear un buffer de imagen del tamaño correcto (RGBA, 4 floats por píxel)
+            int bufferSize = config.Width * config.Height * 4;
+            float[] emptyImageBuffer = new float[bufferSize];
+            
+            // (Opcional) Podríamos llenar el buffer con un color de fondo aquí si quisiéramos.
+            // Por ahora, devolverlo vacío (negro) está bien.
+
+            // Devolver el buffer vacío dentro de una tarea completada.
+            return Task.FromResult(emptyImageBuffer);
+        }
         
         public async Task<float[]> ExecuteDepthRayTracingAsync(
             ExtractedGeometry geometry,

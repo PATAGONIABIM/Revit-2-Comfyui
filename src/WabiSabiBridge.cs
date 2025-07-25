@@ -190,7 +190,7 @@ namespace WabiSabiBridge
 
                 var options = new ImageExportOptions
                 {
-                    FilePath = tempRenderPath.Replace(".png", ""), // Revit añade la extensión
+                    FilePath = tempRenderPath.Replace(".png", ""),
                     HLRandWFViewsFileType = ImageFileType.PNG,
                     ImageResolution = ImageResolution.DPI_150,
                     ZoomType = ZoomFitType.Zoom,
@@ -198,140 +198,124 @@ namespace WabiSabiBridge
                 };
                 doc.ExportImage(options);
 
-                // --- TAREA 3: CALCULAR DATOS DE PROFUNDIDAD (en el hilo de Revit) ---
+                // --- TAREA 3: CALCULAR DATOS DE PROFUNDIDAD Y/O LÍNEAS (en el hilo de Revit) ---
                 double[,]? depthData = null;
                 if (this.ExportDepth)
                 {
-                    UpdateStatusCallback?.Invoke("Calculando profundidad...", System.Drawing.Color.Blue);
+                    UpdateStatusCallback?.Invoke("Calculando profundidad/líneas...", System.Drawing.Color.Blue);
                     try
                     {
                         IList<XYZ> viewCorners = GetEffectiveViewCorners(uiView);
                         _gpuManager ??= new GpuAccelerationManager(null);
+
+                        bool useFallbackMode = false;
                         
-                        if (UseGeometryExtraction && UseGpuAcceleration && _gpuManager?.IsGpuAvailable == true)
+                        // Modo "Alta": es el modo inteligente que usa la GPU para líneas si puede.
+                        if (DepthQuality == 2) // Calidad "Alta (Geometría/GPU)"
                         {
-                            // Lógica reconstruida para el modo experimental
-                            var cacheManager = GeometryCacheManager.Instance;
-                            var cachedData = cacheManager.EnsureCacheIsValid(doc, view3D, UpdateStatusCallback);
-                            if (!cacheManager.IsCacheValid || cachedData.TriangleCount == 0)
+                            // Si tenemos GPU, usamos el renderizado de líneas.
+                            if (UseGpuAcceleration && _gpuManager?.IsGpuAvailable == true)
                             {
-                                WabiSabiLogger.Log("Caché de geometría no válido o vacío. Saltando ray-tracing en GPU para modo experimental.", LogLevel.Warning);
-                                depthData = new double[targetHeight, targetWidth]; // Asignar un mapa de profundidad vacío.
-                            }
-                            else
-                            {
-                            var eyePosition = view3D.GetOrientation().EyePosition;
+                                var cacheManager = GeometryCacheManager.Instance;
+                                var cachedData = cacheManager.EnsureCacheIsValid(doc, view3D, UpdateStatusCallback);
 
-                            // --- LÓGICA DE CONFIGURACIÓN DE RAYTRACING ---
-                            // Obtener los vectores de la cámara tal como los necesita el shader.
-                            // El shader calcula la dirección de cada rayo interpolando desde la esquina inferior izquierda.
-                            XYZ bottomLeft = viewCorners[0];
-                            XYZ topRight = viewCorners[1];
-                            
-                            var camOrientation = view3D.GetOrientation();
-                            var upDir = camOrientation.UpDirection.Normalize();
-                            var rightDir = camOrientation.ForwardDirection.CrossProduct(upDir).Normalize();
-
-                            // Calcular el vector que representa el ancho total y la altura total de la vista.
-                            XYZ viewWidthVec = (topRight - bottomLeft).DotProduct(rightDir) * rightDir;
-                            XYZ viewHeightVec = (topRight - bottomLeft).DotProduct(upDir) * upDir;
-                            
-                            // Calcular el rango de profundidad (min/max).
-                            double minDepth = 0.1;
-                            double maxDepth;
-                            if (AutoDepthRange)
-                            {
-                                // Lógica de cálculo de profundidad automática (simplificada de otras partes del código)
-                                double distanceToTarget = -1.0;
-                                if (view3D.CropBox.Enabled)
+                                if (cacheManager.IsCacheValid && cachedData.TriangleCount > 0)
                                 {
-                                    var cropCenter = (view3D.CropBox.Min + view3D.CropBox.Max) / 2.0;
-                                    double distanceAlongView = (cropCenter - eyePosition).DotProduct(camOrientation.ForwardDirection);
-                                    if (distanceAlongView > 0) distanceToTarget = distanceAlongView;
+                                    var eyePosition = view3D.GetOrientation().EyePosition;
+                                    XYZ bottomLeft = viewCorners[0];
+                                    XYZ topRight = viewCorners[1];
+                                    var upDir = orientation.UpDirection.Normalize();
+                                    var rightDir = orientation.ForwardDirection.CrossProduct(upDir).Normalize();
+                                    XYZ viewWidthVec = (topRight - bottomLeft).DotProduct(rightDir) * rightDir;
+                                    XYZ viewHeightVec = (topRight - bottomLeft).DotProduct(upDir) * upDir;
+                                    double minDepth = 0.1;
+                                    double maxDepth = AutoDepthRange ? 
+                                        (view3D.CropBox.Enabled ? (view3D.CropBox.Max - view3D.CropBox.Min).GetLength() * 1.2 : 100.0) 
+                                        : DepthRangeDistance;
+
+                                    var config = new RayTracingConfig
+                                    {
+                                        EyePosition = new ComputeSharp.Float3((float)eyePosition.X, (float)eyePosition.Y, (float)eyePosition.Z),
+                                        ViewDirection = new ComputeSharp.Float3((float)(bottomLeft.X - eyePosition.X), (float)(bottomLeft.Y - eyePosition.Y), (float)(bottomLeft.Z - eyePosition.Z)),
+                                        RightDirection = new ComputeSharp.Float3((float)viewWidthVec.X, (float)viewWidthVec.Y, (float)viewWidthVec.Z),
+                                        UpDirection = new ComputeSharp.Float3((float)viewHeightVec.X, (float)viewHeightVec.Y, (float)viewHeightVec.Z),
+                                        Width = targetWidth, 
+                                        Height = targetHeight, 
+                                        MinDepth = (float)minDepth, 
+                                        MaxDepth = (float)maxDepth
+                                    };
+
+                                    // GENERAR LÍNEAS con GPU
+                                    UpdateStatusCallback?.Invoke("Renderizando líneas (GPU)...", System.Drawing.Color.Green);
+                                    var lineTask = Task.Run(async () => await _gpuManager.ExecuteLineRenderAsync(
+                                        cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config));
+                                    float[] gpuLineBuffer = lineTask.Result;
+                                    
+                                    // Guardar líneas directamente
+                                    GenerateImageFromGpuBuffer(gpuLineBuffer, targetWidth, targetHeight, this.OutputPath, timestamp);
+                                    
+                                    // TAMBIÉN GENERAR DEPTH con GPU
+                                    UpdateStatusCallback?.Invoke("Calculando profundidad (GPU)...", System.Drawing.Color.Blue);
+                                    var depthTask = Task.Run(async () => await _gpuManager.ExecuteDepthRayTracingFromCacheAsync(
+                                        cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config));
+                                    float[] gpuDepthBuffer = depthTask.Result;
+                                    
+                                    // Convertir float[] a double[,]
+                                    depthData = new double[targetHeight, targetWidth];
+                                    Parallel.For(0, targetHeight, y =>
+                                    {
+                                        for (int x = 0; x < targetWidth; x++)
+                                        {
+                                            int idx = y * targetWidth + x;
+                                            depthData[y, x] = gpuDepthBuffer[idx];
+                                        }
+                                    });
+                                    
+                                    // No exportar la imagen de Revit ya que usamos GPU directamente
+                                    tempRenderPath = "";
                                 }
-                                maxDepth = distanceToTarget > 0 ? distanceToTarget * 1.2 : 100.0;
+                                else
+                                {
+                                    UpdateStatusCallback?.Invoke("Caché no válido, usando modo Normal.", System.Drawing.Color.Orange);
+                                    useFallbackMode = true;
+                                }
                             }
-                            else
+                            else // Si no hay GPU, usamos el fallback de extracción de geometría (CPU)
                             {
-                                maxDepth = DepthRangeDistance;
-                            }
-
-                            // Crear y poblar la configuración para la GPU.
-                            var config = new RayTracingConfig
-                            {
-                                EyePosition = new ComputeSharp.Float3((float)eyePosition.X, (float)eyePosition.Y, (float)eyePosition.Z),
-                                
-                                // ViewDirection en el shader es el vector desde el ojo a la esquina inferior izquierda.
-                                ViewDirection = new ComputeSharp.Float3(
-                                    (float)(bottomLeft.X - eyePosition.X),
-                                    (float)(bottomLeft.Y - eyePosition.Y),
-                                    (float)(bottomLeft.Z - eyePosition.Z)
-                                ),
-                                // RightDirection en el shader es el vector que abarca el ancho de la vista.
-                                RightDirection = new ComputeSharp.Float3((float)viewWidthVec.X, (float)viewWidthVec.Y, (float)viewWidthVec.Z),
-                                // UpDirection en el shader es el vector que abarca la altura de la vista.
-                                UpDirection = new ComputeSharp.Float3((float)viewHeightVec.X, (float)viewHeightVec.Y, (float)viewHeightVec.Z),
-                                
-                                Width = targetWidth,
-                                Height = targetHeight,
-                                MinDepth = (float)minDepth,
-                                MaxDepth = (float)maxDepth
-                            };
-                            
-                            var depthTask = Task.Run(async () => await _gpuManager.ExecuteDepthRayTracingFromCacheAsync(
-                                cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config));
-
-                            float[] gpuDepthBuffer = depthTask.Result;
-                            depthData = new double[targetHeight, targetWidth];
-                            Parallel.For(0, targetHeight, y => {
-                                for (int x = 0; x < targetWidth; x++) depthData[y, x] = gpuDepthBuffer[y * targetWidth + x];
-                            });
-                            }
-                        }
-                        else
-                        {
-                            // LÓGICA RECONSTRUIDA para los modos de calidad
-                            if (DepthQuality == 0) // Rápida
-                            {
-                                _depthExtractorFast ??= new DepthExtractorFast(app, DepthResolution, 4);
-                                _depthExtractorFast.AutoDepthRange = this.AutoDepthRange;
-                                _depthExtractorFast.ManualDepthDistance = this.DepthRangeDistance;
-                                _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
-                                depthData = _depthExtractorFast.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners);
-                                WabiSabiLogger.Log($"DepthData (Rápida) dimensions: {depthData?.GetLength(0)}x{depthData?.GetLength(1)}", LogLevel.Debug);
-                            }
-                            else if (DepthQuality == 2) // Alta
-                            {
+                                UpdateStatusCallback?.Invoke("Extrayendo geometría (CPU)...", System.Drawing.Color.Blue);
                                 _depthExtractor ??= new DepthExtractor(app, DepthResolution);
                                 _depthExtractor.AutoDepthRange = this.AutoDepthRange;
                                 _depthExtractor.ManualDepthDistance = this.DepthRangeDistance;
-                                _depthExtractor.UseGpuAcceleration = this.UseGpuAcceleration;
-                                _depthExtractor.UseGeometryExtraction = this.UseGeometryExtraction;
+                                _depthExtractor.UseGpuAcceleration = false;
+                                _depthExtractor.UseGeometryExtraction = true;
                                 _depthExtractor.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners, this.OutputPath, timestamp);
                                 depthData = null; // La imagen se guarda directamente en el extractor
                             }
-                            else // Normal
-                            {
-                                _depthExtractorFast ??= new DepthExtractorFast(app, DepthResolution, 2);
-                                _depthExtractorFast.AutoDepthRange = this.AutoDepthRange;
-                                _depthExtractorFast.ManualDepthDistance = this.DepthRangeDistance;
-                                _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
-                                depthData = _depthExtractorFast.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners);
-                                WabiSabiLogger.Log($"DepthData (Normal) dimensions: {depthData?.GetLength(0)}x{depthData?.GetLength(1)}", LogLevel.Debug);
-                            }
+                        }
+                        
+                        // Si no es modo Alta o si necesitamos usar fallback
+                        if (DepthQuality != 2 || useFallbackMode)
+                        {
+                            // Usar el modo apropiado según la calidad
+                            int effectiveQuality = useFallbackMode ? 1 : DepthQuality; // Si es fallback, usar Normal
+                            
+                            _depthExtractorFast ??= new DepthExtractorFast(app, DepthResolution, effectiveQuality == 0 ? 4 : 2);
+                            _depthExtractorFast.AutoDepthRange = this.AutoDepthRange;
+                            _depthExtractorFast.ManualDepthDistance = this.DepthRangeDistance;
+                            _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
+                            depthData = _depthExtractorFast.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners);
                         }
                     }
                     catch (Exception ex)
                     {
-                        UpdateStatusCallback?.Invoke($"Error calculando Depth: {ex.Message}", System.Drawing.Color.Orange);
-                        WabiSabiLogger.LogError("Error durante el cálculo de profundidad en el hilo de Revit", ex);
+                        UpdateStatusCallback?.Invoke($"Error calculando: {ex.Message}", System.Drawing.Color.Orange);
+                        WabiSabiLogger.LogError("Error durante el cálculo de profundidad/líneas", ex);
                     }
                 }
-
-                // --- TAREA 4: Crear y encolar el trabajo ---
+                // --- TAREA 4: Crear y encolar el trabajo (sin cambios) ---
                 var job = new ExportJob
                 {
-                    TempRenderPath = tempRenderPath,
+                    TempRenderPath = tempRenderPath ?? "", // Puede ser null/empty en modo GPU líneas
                     TargetWidth = targetWidth,
                     TargetHeight = targetHeight,
                     IsCropActive = isCropActive,
@@ -349,14 +333,18 @@ namespace WabiSabiBridge
                     CamUpX = orientation.UpDirection.X, CamUpY = orientation.UpDirection.Y, CamUpZ = orientation.UpDirection.Z,
                     ProjectName = doc.Title,
                     ProjectPath = doc.PathName,
-                    GpuAccelerated = this.UseGpuAcceleration,
-                    DepthData = depthData, // <-- ¡Adjuntamos el resultado del cálculo!
-                    EventHandler = this // Asignamos la instancia actual de ExportEventHandler
+                    GpuAccelerated = this.UseGpuAcceleration && this.DepthQuality == 2, // Marcamos como acelerado solo en este modo
+                    DepthData = depthData,
+                    EventHandler = this
                 };
 
-                WabiSabiBridgeApp._exportQueue.Enqueue(job);
-                UpdateStatusCallback?.Invoke($"Encolado: {job.Timestamp}", System.Drawing.Color.CornflowerBlue);
-            }
+                // Solo encolar si hay algo que procesar
+                if (!string.IsNullOrEmpty(job.TempRenderPath) || job.DepthData != null)
+                {
+                    WabiSabiBridgeApp._exportQueue.Enqueue(job);
+                    UpdateStatusCallback?.Invoke($"Encolado: {job.Timestamp}", System.Drawing.Color.CornflowerBlue);
+                }
+                }
             catch (Exception ex)
             {
                 WabiSabiLogger.LogError("Error crítico en ExportEventHandler.Execute", ex);
@@ -368,6 +356,56 @@ namespace WabiSabiBridge
         private static IList<XYZ> GetEffectiveViewCorners(UIView uiView)
         {            
             return uiView.GetZoomCorners();            
+        }
+
+        // NUEVO MÉTODO: Genera y guarda una imagen desde un buffer RGBA de la GPU
+        private void GenerateImageFromGpuBuffer(float[] buffer, int width, int height, string outputPath, string timestamp)
+        {
+            // Validación de seguridad
+            if (buffer == null || buffer.Length != width * height * 4)
+            {
+                WabiSabiLogger.LogError($"Buffer inválido: esperado {width * height * 4} elementos, recibido {buffer?.Length ?? 0}");
+                return;
+            }
+            using var finalBitmap = new Drawing.Bitmap(width, height, PixelFormat.Format32bppArgb);
+            BitmapData bmpData = finalBitmap.LockBits(new Drawing.Rectangle(0, 0, width, height), ImageLockMode.WriteOnly, finalBitmap.PixelFormat);
+            
+            try
+            {
+                // SOLUCIÓN: Convertir float[] a byte[] correctamente
+                int pixelCount = width * height;
+                byte[] byteBuffer = new byte[pixelCount * 4]; // 4 bytes por pixel (ARGB)
+                
+                // Conversión paralela para mejor rendimiento
+                Parallel.For(0, pixelCount, i =>
+                {
+                    // Los datos vienen como RGBA float [0,1], convertir a ARGB byte [0,255]
+                    int srcIdx = i * 4;
+                    int dstIdx = i * 4;
+                    
+                    // Clamp y conversión de float a byte
+                    byteBuffer[dstIdx] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx + 3] * 255)));     // A
+                    byteBuffer[dstIdx + 1] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx] * 255)));     // R
+                    byteBuffer[dstIdx + 2] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx + 1] * 255))); // G
+                    byteBuffer[dstIdx + 3] = (byte)(Math.Max(0, Math.Min(255, buffer[srcIdx + 2] * 255))); // B
+                });
+                
+                // Ahora sí copiar los bytes correctamente
+                System.Runtime.InteropServices.Marshal.Copy(byteBuffer, 0, bmpData.Scan0, byteBuffer.Length);
+            }
+            finally
+            {
+                finalBitmap.UnlockBits(bmpData);
+            }
+            
+            string targetFile = Path.Combine(outputPath, "current_render.png");
+            finalBitmap.Save(targetFile, System.Drawing.Imaging.ImageFormat.Png);
+            
+            if (SaveTimestampedRender)
+            {
+                finalBitmap.Save(Path.Combine(outputPath, $"render_{timestamp}.png"), System.Drawing.Imaging.ImageFormat.Png);
+            }
+            WabiSabiLogger.Log($"Imagen de líneas (GPU) exportada: {targetFile}", LogLevel.Debug);
         }
         
         private void ExportHiddenLineImage(Document doc, View3D view3D, string outputPath, string timestamp, 
@@ -610,7 +648,7 @@ namespace WabiSabiBridge
 
             exportOptionsGroup.Controls.Add(new WinForms.Label { Text = "Calidad:", Location = new Drawing.Point(220, 45), Width = 50 });
             _depthQualityCombo = new WinForms.ComboBox { Location = new Drawing.Point(270, 43), Width = 80, DropDownStyle = WinForms.ComboBoxStyle.DropDownList };
-            _depthQualityCombo.Items.AddRange(new object[] { "Rápida", "Normal", "Alta" });
+            _depthQualityCombo.Items.AddRange(new object[] { "Rápida", "Normal", "Alta (Geometría/GPU)" });
             _depthQualityCombo.SelectedIndex = _config.DepthQuality;
             _depthQualityCombo.SelectedIndexChanged += (s, e) => { _config.DepthQuality = _depthQualityCombo.SelectedIndex; _config.Save(); UpdateTimeEstimate(); };
 
@@ -721,16 +759,30 @@ namespace WabiSabiBridge
             }
         }
         private void UpdateTimeEstimate() {
-            // CAMBIO: Se usa coincidencia de patrones y se sale antes si no se encuentra el control.
             if (Controls.Find("timeEstimateLabel", true).FirstOrDefault() is not WinForms.Label timeLabel) return;
 
             if (!_exportDepthCheckBox.Checked) { timeLabel.Text = ""; return; }
             
-            int resIndex = _config.DepthResolution == 256 ? 0 : _config.DepthResolution == 512 ? 1 : _config.DepthResolution == 1024 ? 2 : 3;
             int quality = _config.DepthQuality;
             bool useGpu = _config.UseGpuAcceleration;
+
+            // --- LÓGICA DE ESTIMACIÓN CORREGIDA ---
+            if (quality == 2) // Calidad "Alta"
+            {
+                if (useGpu)
+                {
+                    timeLabel.Text = "Tiempo estimado: Muy rápido (Renderizado de líneas en GPU)";
+                }
+                else
+                {
+                    timeLabel.Text = "Tiempo estimado: ~2-5 minutos (Extracción de geometría en CPU)";
+                }
+                return;
+            }
+            
+            int resIndex = _config.DepthResolution == 256 ? 0 : _config.DepthResolution == 512 ? 1 : _config.DepthResolution == 1024 ? 2 : 3;
             int[,] timeMatrix = useGpu ? new int[,] { { 1, 1, 2 }, { 1, 3, 5 }, { 2, 8, 15 }, { 8, 30, 60 } } 
-                                     : new int[,] { { 1, 3, 5 }, { 3, 10, 20 }, { 10, 40, 80 }, { 40, 160, 320 } };
+                                    : new int[,] { { 1, 3, 5 }, { 3, 10, 20 }, { 10, 40, 80 }, { 40, 160, 320 } };
             int seconds = timeMatrix[resIndex, quality] * (_config.UseGeometryExtraction ? 2 : 1);
             
             timeLabel.Text = $"Tiempo estimado: ~{(seconds < 60 ? $"{seconds} segundos" : $"{seconds / 60} minutos")}{(useGpu ? " (GPU)" : " (CPU)")}";
@@ -877,8 +929,11 @@ namespace WabiSabiBridge
                     {
                         WabiSabiLogger.Log($"Procesando trabajo: {job.Timestamp}", LogLevel.Debug);
 
-                        // --- 1. PROCESAR Y GUARDAR IMAGEN DE RENDER ---
-                        string finalRenderPath = Path.Combine(job.FinalOutputPath, "current_render.png");
+                        // --- 1. PROCESAR Y GUARDAR IMAGEN RENDERIZADA ---
+                        // Solo procesar si hay una imagen de Revit que procesar
+                        if (!string.IsNullOrWhiteSpace(job.TempRenderPath) && File.Exists(job.TempRenderPath))
+                        {
+                            string finalRenderPath = Path.Combine(job.FinalOutputPath, "current_render.png");
                         
                         using (var originalImage = System.Drawing.Image.FromFile(job.TempRenderPath))
                         using (var finalBitmap = new System.Drawing.Bitmap(job.TargetWidth, job.TargetHeight))
@@ -916,14 +971,17 @@ namespace WabiSabiBridge
                             }
                         }
                         
-                        try { File.Delete(job.TempRenderPath); } catch { }
-                        WabiSabiLogger.Log($"Imagen procesada y guardada: {finalRenderPath}", LogLevel.Debug);
-                        
-                        // --- 2. PROCESAR Y GUARDAR IMAGEN DE PROFUNDIDAD (BLOQUE AÑADIDO) ---
+                            try { File.Delete(job.TempRenderPath); } catch { }
+                            WabiSabiLogger.Log($"Imagen procesada y guardada: {finalRenderPath}", LogLevel.Debug);
+                        }
+                        // Si TempRenderPath está vacío, significa que ya se procesó directamente desde GPU
+
+                        // --- 2. PROCESAR Y GUARDAR IMAGEN DE PROFUNDIDAD ---
                         if (job.DepthData != null)
                         {
                             WabiSabiLogger.Log("Procesando datos de profundidad...", LogLevel.Debug);
-                            job.EventHandler?.GenerateDepthImage(job.DepthData, job.TargetWidth, job.TargetHeight, job.FinalOutputPath, job.Timestamp, job.SaveTimestampedDepth);
+                            job.EventHandler?.GenerateDepthImage(job.DepthData, job.TargetWidth, job.TargetHeight, 
+                                job.FinalOutputPath, job.Timestamp, job.SaveTimestampedDepth);
                             WabiSabiLogger.Log("Imagen de profundidad guardada.", LogLevel.Debug);
                         }
 
@@ -2301,6 +2359,8 @@ namespace WabiSabiBridge
                 DepthResolution = GetNearestPowerOfTwo(DepthResolution);
                 
                 if (DepthQuality < 0) DepthQuality = 0;
+                // --- CORRECCIÓN ---
+                // El valor máximo para el índice de calidad ahora es 2.
                 if (DepthQuality > 2) DepthQuality = 2;
                 
                 if (DepthRangeDistance <= 0) DepthRangeDistance = 50.0;

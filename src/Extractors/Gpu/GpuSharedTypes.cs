@@ -23,6 +23,13 @@ namespace WabiSabiBridge.Extractors.Gpu
             int vertexCount, 
             int triangleCount, 
             RayTracingConfig config);
+
+        // NUEVO: Método para ejecutar el renderizado de líneas en la GPU
+        Task<float[]> ExecuteLineRenderAsync(
+            MemoryMappedFile cacheFile,
+            int vertexCount,
+            int triangleCount,
+            RayTracingConfig config);
     }
     
     /// <summary>
@@ -53,5 +60,15 @@ namespace WabiSabiBridge.Extractors.Gpu
         public int Height;
         public float MinDepth;
         public float MaxDepth;
+    }
+
+    /// <summary>
+    /// Estructura para almacenar los datos del G-Buffer (profundidad y normal).
+    /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct GpuBufferData
+    {
+        public float Depth;
+        public Float3 WorldNormal;
     }
 }
