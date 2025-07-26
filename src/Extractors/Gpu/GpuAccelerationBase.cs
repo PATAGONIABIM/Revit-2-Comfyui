@@ -293,6 +293,7 @@ namespace WabiSabiBridge.Extractors.Gpu
         private GraphicsDevice? _device;
         private MemoryMappedFile? _geometryMmf;
         private MemoryMappedViewAccessor? _geometryAccessor;
+        private string? _currentMmfName;
         private readonly ArrayPool<float> _floatPool = ArrayPool<float>.Shared;
         private readonly ArrayPool<int> _intPool = ArrayPool<int>.Shared;
         private readonly WinForms.Form? _owner;
@@ -329,8 +330,9 @@ namespace WabiSabiBridge.Extractors.Gpu
         
         public void CreateGeometrySharedMemory(string name, long sizeInBytes)
         {
-             if (_geometryMmf == null)
+            if (_geometryMmf == null)
             {
+                _currentMmfName = name; // <-- PASO 2.2: GUARDAR EL NOMBRE
                 _geometryMmf = MemoryMappedFile.CreateNew(name, sizeInBytes);
                 _geometryAccessor = _geometryMmf.CreateViewAccessor();
             }
@@ -353,38 +355,43 @@ namespace WabiSabiBridge.Extractors.Gpu
         public async Task<float[]> ExecuteDepthRayTracingAsync(ExtractedGeometry geometry, RayTracingConfig config)
         {
             // Este método ahora se considera un fallback o para un modo específico
-            // El código interno no necesita cambiar
-            return await ExecuteDepthRayTracingFromCacheAsync(_geometryMmf!, geometry.VertexCount, geometry.TriangleCount, config);
+            // El código interno no necesita cambiar, solo la llamada.
+
+            // CAMBIO: Se pasa el nombre guardado (_currentMmfName) en lugar del objeto _geometryMmf.
+            return await ExecuteDepthRayTracingFromCacheAsync(_currentMmfName!, geometry.VertexCount, geometry.TriangleCount, config);
         }
         
         /// <summary>
         /// Ejecuta ray tracing para generar un mapa de profundidad (calidad "Alta").
         /// </summary>
-        public async Task<float[]> ExecuteDepthRayTracingFromCacheAsync(MemoryMappedFile cacheFile, int vertexCount, int triangleCount, RayTracingConfig config)
+        public async Task<float[]> ExecuteDepthRayTracingFromCacheAsync(string mmfName, int vertexCount, int triangleCount, RayTracingConfig config)
         {
             if (!IsGpuAvailable || _device == null)
             {
-                return await Task.Run(() => ExecuteDepthRayTracingFromCacheCpu(cacheFile, vertexCount, triangleCount, config));
+                return await Task.Run(() => ExecuteDepthRayTracingFromCacheCpu(mmfName, vertexCount, triangleCount, config));
             }
 
             return await Task.Run(() =>
             {
-                // CAMBIO: Se usa la sintaxis clásica de C# para compatibilidad.
-                var geometryData = LoadGeometryFromCache(cacheFile, vertexCount, triangleCount);
-
-                using (var vertexBuffer = geometryData.vertexBuffer)
-                using (var triangleBuffer = geometryData.triangleBuffer)
-                using (var normalBuffer = geometryData.normalBuffer)
+                // El consumidor abre su propia vista del MMF y la cierra al terminar.
+                using (var cacheFile = MemoryMappedFile.OpenExisting(mmfName))
                 {
-                    int pixelCount = config.Width * config.Height;
-                    using (var depthBuffer = _device.AllocateReadWriteBuffer<float>(pixelCount))
-                    {
-                        _device.For(config.Width, config.Height, new DepthRayTracingShader(
-                            vertexBuffer, triangleBuffer, normalBuffer, config, depthBuffer));
+                    var geometryData = LoadGeometryFromCache(cacheFile, vertexCount, triangleCount);
 
-                        float[] results = new float[pixelCount];
-                        depthBuffer.CopyTo(results);
-                        return results;
+                    using (var vertexBuffer = geometryData.vertexBuffer)
+                    using (var triangleBuffer = geometryData.triangleBuffer)
+                    using (var normalBuffer = geometryData.normalBuffer)
+                    {
+                        int pixelCount = config.Width * config.Height;
+                        using (var depthBuffer = _device.AllocateReadWriteBuffer<float>(pixelCount))
+                        {
+                            _device.For(config.Width, config.Height, new DepthRayTracingShader(
+                                vertexBuffer, triangleBuffer, normalBuffer, config, depthBuffer));
+
+                            float[] results = new float[pixelCount];
+                            depthBuffer.CopyTo(results);
+                            return results;
+                        }
                     }
                 }
             });
@@ -393,17 +400,20 @@ namespace WabiSabiBridge.Extractors.Gpu
         /// <summary>
         /// NUEVO: Ejecuta el renderizado de líneas en dos pases (calidad "GPU Líneas").
         /// </summary>
-        public async Task<float[]> ExecuteLineRenderAsync(MemoryMappedFile cacheFile, int vertexCount, int triangleCount, RayTracingConfig config)
+        public async Task<float[]> ExecuteLineRenderAsync(string mmfName, int vertexCount, int triangleCount, RayTracingConfig config)
+    {
+        if (!IsGpuAvailable || _device == null)
         {
-            if (!IsGpuAvailable || _device == null)
-            {
-                return new float[config.Width * config.Height * 4]; // Devuelve buffer vacío
-            }
+            return new float[config.Width * config.Height * 4]; // Devuelve buffer vacío
+        }
 
-            return await Task.Run(() =>
-            {
-                var sw = System.Diagnostics.Stopwatch.StartNew();
+        return await Task.Run(() =>
+        {
+            var sw = System.Diagnostics.Stopwatch.StartNew();
 
+            // El consumidor abre su propia vista del MMF y la cierra al terminar.
+            using (var cacheFile = MemoryMappedFile.OpenExisting(mmfName))
+            {
                 var geometryData = LoadGeometryFromCache(cacheFile, vertexCount, triangleCount);
 
                 using (var vertexBuffer = geometryData.vertexBuffer)
@@ -447,6 +457,7 @@ namespace WabiSabiBridge.Extractors.Gpu
                             return results;
                         }
                     }
+                }
                 }
             });
                 
@@ -497,7 +508,7 @@ namespace WabiSabiBridge.Extractors.Gpu
         }
         
         #region Fallbacks de CPU
-        private float[] ExecuteDepthRayTracingFromCacheCpu(MemoryMappedFile cacheFile, int vertexCount, int triangleCount, RayTracingConfig config)
+        private float[] ExecuteDepthRayTracingFromCacheCpu(string mmfName, int vertexCount, int triangleCount, RayTracingConfig config)
         {
             int pixelCount = config.Width * config.Height;
             float[] depthBuffer = new float[pixelCount];
@@ -505,6 +516,8 @@ namespace WabiSabiBridge.Extractors.Gpu
             int[] triangles = _intPool.Rent(triangleCount * 3);
             try
             {
+                // El fallback de CPU también abre su propia vista.
+                using (var cacheFile = MemoryMappedFile.OpenExisting(mmfName))
                 using (var accessor = cacheFile.CreateViewAccessor())
                 {
                     accessor.ReadArray(0, vertices, 0, vertices.Length);

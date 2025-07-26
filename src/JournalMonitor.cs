@@ -31,6 +31,7 @@ namespace WabiSabiBridge
             @",\s*([-.\dE]+)\s*,\s*([-.\dE]+)\s*,\s*([-.\dE]+)",          // Grupo 7,8,9 (Up)
             RegexOptions.Compiled | RegexOptions.Singleline);
 
+        private int _sequenceNumber = 0;
         private readonly StringBuilder _contentBuffer = new StringBuilder();
         public JournalMonitor(LockFreeCameraRingBuffer cameraBuffer)
         {
@@ -123,73 +124,69 @@ namespace WabiSabiBridge
         {
             string contentToProcess = _contentBuffer.ToString();
             
-            // Log para ver exactamente qué estamos analizando
             WabiSabiLogger.LogDiagnostic("JournalMonitor_Buffer", $"Analizando buffer ({contentToProcess.Length} caracteres).");
 
             var matches = _cameraDirectiveRegex.Matches(contentToProcess);
             
             if (matches.Count == 0)
             {
-                // --- INICIO DE CIRUGÍA 2: EVITAR ACUMULACIÓN EXCESIVA DE RUIDO ---
-                // Si el buffer crece mucho (ej. > 15KB) sin encontrar una directiva de cámara,
-                // es probable que solo contenga ruido. Lo limpiamos para evitar que crezca indefinidamente.
                 const int MAX_BUFFER_SIZE = 15 * 1024;
                 if (_contentBuffer.Length > MAX_BUFFER_SIZE)
                 {
                     WabiSabiLogger.LogDiagnostic("JournalMonitor", "Buffer de ruido limpiado para evitar sobrecarga.");
                     _contentBuffer.Clear();
                 }
-                // --- FIN DE CIRUGÍA 2 ---
                 return;
             }
 
-            // Procesamos el último match completo que encontramos
             var lastMatch = matches[matches.Count - 1];
             try
             {
-                // --- INICIO DEL CÓDIGO REAL (REEMPLAZANDO EL PLACEHOLDER) ---
+                // Los valores del journal vienen en orden Y, Z, X
+                // Necesitamos reordenarlos a X, Y, Z
                 
-                // Extraer los 9 valores numéricos de los grupos de captura del Regex
                 var eyePos = new XYZ(
-                    double.Parse(lastMatch.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture),
-                    double.Parse(lastMatch.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture),
-                    double.Parse(lastMatch.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture));
+                    double.Parse(lastMatch.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture), // X = Value[3]
+                    double.Parse(lastMatch.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture), // Y = Value[1]
+                    double.Parse(lastMatch.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture)  // Z = Value[2]
+                );
                 
                 var targetPos = new XYZ(
-                    double.Parse(lastMatch.Groups[4].Value, System.Globalization.CultureInfo.InvariantCulture),
-                    double.Parse(lastMatch.Groups[5].Value, System.Globalization.CultureInfo.InvariantCulture),
-                    double.Parse(lastMatch.Groups[6].Value, System.Globalization.CultureInfo.InvariantCulture));
+                    double.Parse(lastMatch.Groups[6].Value, System.Globalization.CultureInfo.InvariantCulture), // X = Value[6]
+                    double.Parse(lastMatch.Groups[4].Value, System.Globalization.CultureInfo.InvariantCulture), // Y = Value[4]
+                    double.Parse(lastMatch.Groups[5].Value, System.Globalization.CultureInfo.InvariantCulture)  // Z = Value[5]
+                );
 
                 var upDir = new XYZ(
-                    double.Parse(lastMatch.Groups[7].Value, System.Globalization.CultureInfo.InvariantCulture),
-                    double.Parse(lastMatch.Groups[8].Value, System.Globalization.CultureInfo.InvariantCulture),
-                    double.Parse(lastMatch.Groups[9].Value, System.Globalization.CultureInfo.InvariantCulture));
-                    
-                // Calcular la dirección de la vista normalizada
+                    double.Parse(lastMatch.Groups[9].Value, System.Globalization.CultureInfo.InvariantCulture), // X = Value[9]
+                    double.Parse(lastMatch.Groups[7].Value, System.Globalization.CultureInfo.InvariantCulture), // Y = Value[7]
+                    double.Parse(lastMatch.Groups[8].Value, System.Globalization.CultureInfo.InvariantCulture)  // Z = Value[8]
+                );
+
+                // Logging para verificar
+                WabiSabiLogger.Log($"JournalMonitor - Reordered Eye: ({eyePos.X:F2}, {eyePos.Y:F2}, {eyePos.Z:F2})", LogLevel.Debug);
+                WabiSabiLogger.Log($"JournalMonitor - Reordered Target: ({targetPos.X:F2}, {targetPos.Y:F2}, {targetPos.Z:F2})", LogLevel.Debug);
+                WabiSabiLogger.Log($"JournalMonitor - Reordered Up: ({upDir.X:F2}, {upDir.Y:F2}, {upDir.Z:F2})", LogLevel.Debug);
+                
                 var viewDir = (targetPos - eyePos).Normalize();
 
-                // Crear el paquete de datos de la cámara
                 var cameraData = new CameraData
                 {
                     EyePosition = eyePos,
                     ViewDirection = viewDir,
                     UpDirection = upDir,
-                    SequenceNumber = Interlocked.Increment(ref WabiSabiBridgeApp._globalSequenceNumber),
+                    SequenceNumber = Interlocked.Increment(ref _sequenceNumber),
                     Timestamp = System.Diagnostics.Stopwatch.GetTimestamp()
                 };
-
-                // --- FIN DEL CÓDIGO REAL ---
 
                 _cameraBuffer.TryWrite(cameraData);
                 WabiSabiLogger.LogDiagnostic("JournalMonitor_Success", $"¡ÉXITO! Datos de cámara extraídos. Seq: {cameraData.SequenceNumber}");
 
-                // Limpieza Crucial: Borramos el buffer HASTA el final del último match que procesamos.
                 _contentBuffer.Remove(0, lastMatch.Index + lastMatch.Length);
             }
             catch (Exception ex)
             {
                 WabiSabiLogger.LogError("Journal Monitor: Error al parsear datos de cámara del buffer.", ex);
-                // En caso de error de parseo, es más seguro limpiar el buffer para no entrar en un bucle.
                 _contentBuffer.Clear();
             }
         }

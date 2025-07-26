@@ -1,0 +1,32 @@
+Resumen Conceptual: El Renderizador Externo Desacoplado
+La idea central es dividir el problema en dos aplicaciones especializadas que se comunican a través de archivos en el disco, eliminando el cuello de botella del hilo principal de Revit.
+Parte 1: El Plugin de Revit - "El Exportador de Escena"
+Concepto: Piensa en este plugin como una "cámara fotográfica" de alta gama que toma una sola foto muy detallada de la escena 3D completa. Su trabajo es rápido, se hace una vez y termina. No se preocupa del movimiento ni del tiempo real.
+Misión Principal: Convertir la compleja base de datos del modelo de Revit en una representación 3D simple y optimizada que una GPU pueda entender: una lista masiva de triángulos.
+El "Cómo" en 3 Pasos:
+Activación (Manual): El usuario hace clic en un botón "Iniciar Sesión de Renderizado".
+Extracción de Geometría: El plugin recorre todos los objetos visibles en la vista 3D actual (muros, ventanas, muebles) y los descompone en su forma más básica: una "sopa de triángulos". Esta es la tarea del GeometryCacheManager.
+Serialización (Guardado): Esta "sopa de triángulos" (vértices, índices, normales) se guarda en un único archivo binario en el disco. Usamos un MemoryMappedFile (MMF) porque es la forma más rápida de que otra aplicación lea grandes cantidades de datos. El plugin simplemente guarda el archivo (ej. Proyecto1.wabi_geom) y su trabajo ha terminado. Opcionalmente, puede lanzar la segunda aplicación.
+Analogía: Es como un estudio de cine que prepara y construye todo el set de filmación. Una vez que el set está listo, el equipo de filmación (la otra aplicación) puede entrar a grabar.
+Parte 2: La Aplicación Externa - "El Director de Fotografía en Vivo"
+Concepto: Esta es una aplicación independiente y altamente especializada, construida para hacer una sola cosa excepcionalmente bien: renderizar una escena 3D lo más rápido posible. Vive completamente fuera de Revit y no sabe nada sobre "muros" o "familias", solo conoce de triángulos y cámaras.
+Misión Principal: Cargar la escena pre-construida y filmarla desde diferentes ángulos (posiciones de la cámara) a la mayor velocidad posible, generando un flujo de imágenes.
+El "Cómo" en 4 Pasos (un bucle infinito):
+Carga de la Escena (al iniciar): La aplicación se inicia, abre el archivo .wabi_geom y carga toda la geometría en la memoria de la tarjeta gráfica (VRAM). Este es el paso más lento, pero se hace una sola vez al principio.
+Obtención de la Cámara (El Espía): La aplicación inicia el JournalMonitor, que "espía" el archivo journal.txt de Revit. Este monitor lee las coordenadas de la cámara en tiempo real mientras el usuario mueve el Space Mouse dentro de Revit.
+El Bucle de Renderizado (El Corazón): La aplicación entra en un bucle infinito que se ejecuta 30, 60 o más veces por segundo:
+Pregunta: "¿Hay una nueva posición de cámara del espía?"
+Actualiza: Si hay una, envía las nuevas coordenadas de la cámara a la GPU. (Esta es una operación trivialmente rápida).
+¡Renderiza!: Le dice a la GPU: "Usa la escena que ya tienes en memoria y renderízala desde esta nueva posición de cámara".
+Guarda: Escribe las imágenes resultantes (current_render.png, current_depth.png) en la carpeta de salida compartida.
+Integración con ComfyUI: Los nodos de ComfyUI, que están monitorizando esa carpeta, detectan que los archivos han cambiado y cargan automáticamente la nueva imagen, completando el ciclo en tiempo real.
+Analogía: Es el equipo de filmación. Ya tienen el set (.wabi_geom). Su único trabajo es mover la cámara (JournalMonitor) y gritar "¡Acción!" (Render!) una y otra vez, generando fotogramas.
+El Flujo de Integración Completo (La Magia)
+Usuario en Revit: "Quiero renderizar esta escena en vivo". Hace clic en "Iniciar Sesión".
+Plugin de Revit: Trabaja unos minutos, extrae la geometría y la guarda como MiProyecto.wabi_geom. Lanza WabiSabiRenderer.exe.
+Renderizador Externo: Se inicia, carga MiProyecto.wabi_geom en la GPU y empieza a espiar el journal.txt.
+Usuario en Revit: Empieza a navegar con el Space Mouse.
+JournalMonitor: Detecta los cambios y le pasa las nuevas coordenadas de la cámara al bucle del renderizador.
+Bucle del Renderizador: Actualiza la cámara en la GPU, renderiza la escena y sobrescribe current_render.png.
+ComfyUI: Detecta el cambio en current_render.png y actualiza la previsualización.
+El resultado es una separación total de responsabilidades: Revit hace lo que mejor sabe hacer (gestionar un modelo BIM complejo) y el Renderizador Externo hace lo que mejor sabe hacer (aprovechar al máximo la potencia de la GPU sin interrupciones).

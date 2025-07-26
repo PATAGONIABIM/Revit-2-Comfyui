@@ -1,0 +1,33 @@
+Bitácora de Intentos: En Busca del Auto-Export en Tiempo Real
+Objetivo Final: Lograr que WabiSabi Bridge exporte imágenes (render y depth) a un ritmo constante (ej. 12 FPS) mientras el usuario navega fluidamente en una vista 3D, especialmente con un Space Mouse.
+Conclusión Final Alcanzada: El hilo principal de la API de Revit es el cuello de botella insuperable para la creación de imágenes. Cualquier método como doc.ExportImage o el cálculo de geometría para el depth map está atado a este hilo, que se congela durante la navegación. La única solución viable es una arquitectura "headless" donde un proceso externo maneja el renderizado en tiempo real.
+Intento #1: El Enfoque Simple con Timers
+Problema: ¿Cómo detectamos el movimiento de la cámara para disparar el auto-export?
+Hipótesis: Un Timer simple en el hilo de la UI puede sondear la posición de la cámara periódicamente.
+Acción Tomada: Se implementó un System.Windows.Forms.Timer (_directCaptureTimer) que, cada 50ms, llamaba a view3D.GetOrientation() para obtener la posición de la cámara.
+Resultado Obtenido: La exportación solo funcionaba para movimientos muy cortos y entrecortados. Durante una navegación larga y fluida con el Space Mouse, el log se detenía por completo. La detección de movimiento solo ocurría cuando el ratón se movía sobre la UI del plugin, forzando un redibujado.
+Análisis (La Primera Gran Lección): Descubrimos que el hilo principal de la UI de Revit, donde viven los Timers y el evento Idling, se "congela" o se le da una prioridad extremadamente baja durante las operaciones de renderizado intensivo como la navegación. Nuestra fuente de datos no era fiable.
+Intento #2: El Enfoque "Oficial" con DirectContext3D
+Problema: Necesitamos una fuente de datos de la cámara que se ejecute en el hilo de renderizado, no en el hilo de la UI.
+Hipótesis: La API IDirectContext3DServer está diseñada para esto. Su método RenderScene debería ser llamado en cada fotograma del renderizado.
+Acción Tomada: Se eliminaron los Timers. Se implementó una clase CameraDataExtractionServer y se registró en Revit. Toda la lógica de captura se movió al método RenderScene.
+Resultado Obtenido: Fracaso total. El log demostró que el servidor se registraba y activaba correctamente, pero el método RenderScene nunca era llamado por Revit.
+Análisis (La Lección de la "Caja Negra"): Aprendimos que la API de DirectContext3D es una "caja negra" con reglas no documentadas. No basta con registrar y activar el servidor. Probamos varias "cirugías" para convencer a Revit de que nos llamara:
+Implementar NeedsUpdate() devolviendo true. (No funcionó).
+Implementar UseInTransparentPass() devolviendo true. (No funcionó).
+Implementar GetBoundingBox() devolviendo un cuadro gigante para "engañar" al optimizador. (No funcionó).
+Conclusión de esta fase: Por una razón desconocida (versión de Revit, driver del Space Mouse, configuración específica), la API DirectContext3D no era una vía fiable para nuestro caso de uso.
+Intento #3: El "Hack" Inteligente con el JournalMonitor
+Problema: La API "oficial" nos ha fallado. Necesitamos una fuente de datos que sea 100% garantizada.
+Hipótesis (Tu idea): El archivo journal.txt de Revit siempre se actualiza en tiempo real con los datos de la cámara. Podemos leerlo desde un hilo externo.
+Acción Tomada: Se abandonó DirectContext3D. Se creó una nueva clase JournalMonitor que se ejecuta en una Task separada. Este hilo monitoriza el archivo journal, lo analiza con una Regex y escribe los datos de la cámara en nuestro LockFreeCameraRingBuffer.
+Resultado Obtenido: ¡Éxito parcial rotundo! El log se llenó de mensajes de ¡ÉXITO! Datos de cámara extraídos. Demostramos que podíamos obtener un flujo de datos de la cámara perfecto y en tiempo real, completamente inmune al estado del hilo principal de Revit. Nuestro productor de datos ahora era perfecto.
+Intento #4: El Consumidor Inteligente (Limitador de Velocidad)
+Problema: Ahora tenemos un torrente de datos de la cámara, pero la exportación sigue sin dispararse en tiempo real.
+Hipótesis: El productor (JournalMonitor) funciona, pero el consumidor (que dependía de OnIdling) sigue atascado en el hilo principal congelado de Revit.
+Acción Tomada: Se implementó una arquitectura de tres hilos:
+Productor (JournalMonitor): Llena el buffer (ya funciona).
+Consumidor/Limitador (Nueva Task): Se despierta 12 veces por segundo, lee la última posición del buffer y levanta la bandera del ExternalEvent (WabiSabiEvent.Raise()).
+Ejecutor (Hilo de Revit): Espera la bandera para ejecutar el ExportEventHandler.
+Resultado Obtenido: El log demostró que el JournalMonitor y el ConsumerLoop funcionaban, y que la bandera Raise() se levantaba. Sin embargo, la exportación real seguía ocurriendo solo al final del movimiento.
+Análisis (La Verdad Definitiva): Hemos aislado el problema a su núcleo. Podemos saber cuándo exportar en un hilo separado, pero la acción de exportar en sí misma (ExportEventHandler.Execute) depende de que el hilo principal de Revit esté libre para procesar el ExternalEvent. Durante la navegación, no lo está. Hemos llegado al límite de lo que se puede hacer dentro de la API de Revit para la creación de imágenes en tiempo real.

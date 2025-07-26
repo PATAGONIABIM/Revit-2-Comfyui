@@ -30,6 +30,7 @@ using WabiSabiBridge.Extractors.Cache;
 using ComputeSharp;
 
 // --- INICIO DE NUEVOS USINGS ---
+
 using WabiSabiBridge.DirectContext;
 using Autodesk.Revit.DB.ExternalService;
 using Autodesk.Revit.DB.DirectContext3D;
@@ -105,28 +106,21 @@ namespace WabiSabiBridge
             {
                 UIApplication uiApp = commandData.Application;
                 
-                // CAMBIO: Uso de coincidencia de patrones para la comprobación de nulidad.
-                if (uiApp.ActiveUIDocument.Document.ActiveView is not View3D)
+                if (uiApp.ActiveUIDocument?.Document.ActiveView is not View3D)
                 {
-                    Autodesk.Revit.UI.TaskDialog.Show("WabiSabi Bridge", "Por favor, activa una vista 3D antes de ejecutar el comando.");
+                    TaskDialog.Show("WabiSabi Bridge", "Por favor, active una vista 3D antes de ejecutar el comando.");
                     return Result.Failed;
                 }
                 
-                // CAMBIO: Uso de coincidencia de patrones para la comprobación de nulidad.
                 if (_window is null || _window.IsDisposed)
                 {
-                    // La ventana ahora usa los eventos estáticos de la App
-                    _window = new WabiSabiBridgeWindow(
-                        uiApp, 
-                        WabiSabiBridgeApp.WabiSabiEvent!, 
-                        WabiSabiBridgeApp.WabiSabiEventHandler!
-                    );
-                    _window.Show();
+                    // El constructor ahora es más simple. La ventana accederá a los gestores estáticos de WabiSabiBridgeApp.
+                    _window = new WabiSabiBridgeWindow(uiApp);
+                    _window.Show(); // Usar .Show() para una ventana no modal
                 }
                 else
                 {
-                    _window.Show();
-                    _window.Focus();
+                    _window.Activate(); // Traer la ventana al frente si ya está abierta
                 }
                 
                 return Result.Succeeded;
@@ -210,7 +204,7 @@ namespace WabiSabiBridge
 
         private DepthExtractor? _depthExtractor = null;
         private DepthExtractorFast? _depthExtractorFast = null;
-        private GpuAccelerationManager? _gpuManager;
+        
         
         public async void Execute(UIApplication app)
         {
@@ -219,63 +213,31 @@ namespace WabiSabiBridge
                 UIDocument uiDoc = app.ActiveUIDocument;
                 Document doc = uiDoc.Document;
 
-                if (doc.ActiveView is not View3D view3D) return;
+                if (doc.ActiveView is not View3D view3D)
+                {
+                    TaskDialog.Show("WabiSabi Bridge", "No hay una vista 3D activa.");
+                    return;
+                }
 
-                ViewOrientation3D? orientation; // Usamos un nullable para la orientación
-
-                // --- INICIO DE CIRUGÍA: LÓGICA HÍBRIDA ---
-
-                // PASO 1: INTENTAR OBTENER DATOS DEL BUFFER (MODO AUTO-EXPORT)
-                CameraData latestCameraData = default;
-                bool hasDataFromBuffer = false;
+                // --- LÓGICA SIMPLIFICADA PARA EXPORTACIÓN MANUAL ---
                 
-                if (WabiSabiBridgeApp._cameraBuffer != null)
-                {
-                    while (WabiSabiBridgeApp._cameraBuffer.TryRead(out CameraData data))
-                    {
-                        latestCameraData = data;
-                        hasDataFromBuffer = true;
-                    }
-                }
+                UpdateStatusCallback?.Invoke("Exportación manual iniciada...", System.Drawing.Color.Blue);
 
-                if (hasDataFromBuffer)
+                // Obtenemos la orientación de la cámara directamente de la vista activa en el momento del clic.
+                // Esta es la forma tradicional y correcta para una exportación manual.
+                var orientation = view3D.GetOrientation();
+                if (orientation == null)
                 {
-                    // Hay datos del journal, estamos en modo AUTO-EXPORT
-                    
-                    // Verificamos que no estemos procesando un fotograma antiguo
-                    if (latestCameraData.SequenceNumber <= WabiSabiBridgeApp._lastProcessedSequenceNumber)
-                    {
-                        return; // Salir si ya hemos procesado este frame o uno más nuevo
-                    }
-                    WabiSabiBridgeApp._lastProcessedSequenceNumber = latestCameraData.SequenceNumber;
-
-                    // Creamos la orientación a partir de los datos del buffer
-                    orientation = new ViewOrientation3D(
-                        latestCameraData.EyePosition, 
-                        latestCameraData.UpDirection, 
-                        latestCameraData.ViewDirection);
-                    
-                    WabiSabiLogger.LogDiagnostic("Export", $"Exportando frame de Auto-Export. Seq: {latestCameraData.SequenceNumber}");
-                }
-                else
-                {
-                    // No hay datos en el buffer, asumimos que es una EXPORTACIÓN MANUAL
-                    
-                    // Obtenemos la orientación de la forma tradicional, desde la vista activa
-                    orientation = view3D.GetOrientation();
-                    WabiSabiLogger.LogDiagnostic("Export", "Exportando por petición manual.");
+                    UpdateStatusCallback?.Invoke("Error: No se pudo obtener la orientación de la cámara.", System.Drawing.Color.Red);
+                    return;
                 }
                 
-                // Si por alguna razón no tenemos orientación, salimos.
-                if (orientation == null) return;
+                WabiSabiLogger.LogDiagnostic("Export", "Iniciando exportación por petición manual del usuario.");
 
-                // --- FIN DE CIRUGÍA ---
+                // --- FIN DE LA LÓGICA SIMPLIFICADA ---
 
-                UpdateStatusCallback?.Invoke("Capturando vista...", System.Drawing.Color.Blue);
 
                 // --- TAREA 1: Recolectar datos de Revit ---
-                // El resto del método ahora usa la variable 'orientation', que está
-                // garantizada de tener un valor correcto para CUALQUIERA de los dos casos.
                 string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmssfff");
                 
                 bool isCropActive = view3D.CropBoxActive;
@@ -304,22 +266,21 @@ namespace WabiSabiBridge
                 };
                 doc.ExportImage(options);
 
-                // --- TAREA 3: CALCULAR DATOS DE PROFUNDIDAD Y/O LÍNEAS (en el hilo de Revit) ---
+                // --- TAREA 3: CALCULAR DATOS DE PROFUNDIDAD Y/O LÍNEAS ---
                 double[,]? depthData = null;
-                // NOTA PARA SOLUCIONAR EL ERROR: El error 'Object reference...' se debe a que el control _depthRangeTrackBar
-                // no está inicializado en la clase WabiSabiBridgeWindow. Debe añadir su creación en el método InitializeComponent.
                 if (this.ExportDepth)
                 {
                     UpdateStatusCallback?.Invoke("Calculando profundidad/líneas...", System.Drawing.Color.Blue);
                     try
                     {
                         IList<XYZ> viewCorners = GetEffectiveViewCorners(uiView);
-                        _gpuManager ??= new GpuAccelerationManager(null);
+                        
+                        // --- INICIO DE CIRUGÍA ---
+                        // 1. Obtener la referencia al gestor de GPU estático.
+                        var gpuManager = WabiSabiBridgeApp.GpuManager;
 
-                        bool useFallbackMode = false;
-
-                        // --- INICIO DE ACTUALIZACIÓN: Integración de ModernProgressDialog ---
-                        if (DepthQuality == 2 && UseGpuAcceleration && _gpuManager?.IsGpuAvailable == true) // Calidad "Alta (Geometría/GPU)"
+                        // 2. Usar la instancia 'gpuManager' en la condición.
+                        if (DepthQuality == 2 && UseGpuAcceleration && gpuManager?.IsGpuAvailable == true)
                         {
                             (double[,]? GpuDepthData, bool RenderedOnGpu) result = (null, false);
                             using (var progressDialog = new ModernProgressDialog("Procesando Geometría (GPU)"))
@@ -328,7 +289,6 @@ namespace WabiSabiBridge
                                 {
                                     result = await progressDialog.RunAsync(async (progress, cancellationToken) =>
                                     {
-                                        // --- Etapa 1: Caché de geometría (0% -> 50%) ---
                                         var cacheManager = GeometryCacheManager.Instance;
                                         Action<string, System.Drawing.Color> progressCallback = (msg, color) =>
                                         {
@@ -337,20 +297,16 @@ namespace WabiSabiBridge
                                             {
                                                 percent = int.Parse(match.Groups[1].Value);
                                             }
-                                            // Escalar el progreso a la primera mitad de la barra
                                             progress.Report((percent / 2, msg));
                                         };
 
                                         var cachedData = await Task.Run(() => cacheManager.EnsureCacheIsValid(doc, view3D, progressCallback), cancellationToken);
-                                        cancellationToken.ThrowIfCancellationRequested();
-
-                                        if (!cacheManager.IsCacheValid || cachedData.TriangleCount == 0)
+                                        if (!cachedData.IsValid)
                                         {
                                             throw new InvalidOperationException("No se pudo generar un caché de geometría válido.");
                                         }
 
-                                        // Configuración para el renderizado
-                                        var eyePosition = view3D.GetOrientation().EyePosition;
+                                        var eyePosition = orientation.EyePosition; // Usar la orientación capturada
                                         XYZ bottomLeft = viewCorners[0];
                                         XYZ topRight = viewCorners[1];
                                         var upDir = orientation.UpDirection.Normalize();
@@ -358,9 +314,7 @@ namespace WabiSabiBridge
                                         XYZ viewWidthVec = (topRight - bottomLeft).DotProduct(rightDir) * rightDir;
                                         XYZ viewHeightVec = (topRight - bottomLeft).DotProduct(upDir) * upDir;
                                         double minDepth = 0.1;
-                                        double maxDepth = AutoDepthRange ? 
-                                            (view3D.CropBox.Enabled ? (view3D.CropBox.Max - view3D.CropBox.Min).GetLength() * 1.2 : 100.0) 
-                                            : DepthRangeDistance;
+                                        double maxDepth = AutoDepthRange ? (view3D.CropBox.Enabled ? (view3D.CropBox.Max - view3D.CropBox.Min).GetLength() * 1.2 : 100.0) : DepthRangeDistance;
 
                                         var config = new RayTracingConfig
                                         {
@@ -371,18 +325,18 @@ namespace WabiSabiBridge
                                             Width = targetWidth, Height = targetHeight, MinDepth = (float)minDepth, MaxDepth = (float)maxDepth
                                         };
 
-                                        // --- Etapa 2: Renderizado de líneas (50% -> 75%) ---
                                         progress.Report((50, "Renderizando líneas con GPU..."));
-                                        float[] gpuLineBuffer = await _gpuManager.ExecuteLineRenderAsync(cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config);
-                                        cancellationToken.ThrowIfCancellationRequested();
+                                        
+                                        // --- INICIO DE CIRUGÍA 1 ---
+                                        // CAMBIO: Usar .MmfName en lugar de .GeometryMmf
+                                        float[] gpuLineBuffer = await gpuManager.ExecuteLineRenderAsync(cachedData.MmfName, cachedData.VertexCount, cachedData.TriangleCount, config);
                                         GenerateImageFromGpuBuffer(gpuLineBuffer, targetWidth, targetHeight, this.OutputPath, timestamp);
                                         
-                                        // --- Etapa 3: Renderizado de profundidad (75% -> 95%) ---
                                         progress.Report((75, "Calculando profundidad con GPU..."));
-                                        float[] gpuDepthBuffer = await _gpuManager.ExecuteDepthRayTracingFromCacheAsync(cachedData.GeometryMmf, cachedData.VertexCount, cachedData.TriangleCount, config);
-                                        cancellationToken.ThrowIfCancellationRequested();
+                                        // CAMBIO: Usar .MmfName en lugar de .GeometryMmf
+                                        float[] gpuDepthBuffer = await gpuManager.ExecuteDepthRayTracingFromCacheAsync(cachedData.MmfName, cachedData.VertexCount, cachedData.TriangleCount, config);
+                                        // --- FIN DE CIRUGÍA 1 ---
                                         
-                                        // --- Etapa 4: Conversión de datos (95% -> 100%) ---
                                         progress.Report((95, "Finalizando..."));
                                         var finalDepthData = new double[targetHeight, targetWidth];
                                         Parallel.For(0, targetHeight, y =>
@@ -395,42 +349,32 @@ namespace WabiSabiBridge
                                         });
                                         
                                         progress.Report((100, "¡Completado!"));
-                                        await Task.Delay(500, cancellationToken); // Pausa para ver el mensaje final
+                                        await Task.Delay(500, cancellationToken);
 
                                         return (finalDepthData, true);
                                     });
-
-                                    // Asignar resultados después de que el diálogo se complete
+                                    
                                     depthData = result.GpuDepthData;
                                     if (result.RenderedOnGpu)
                                     {
-                                        // La imagen de render ya fue generada por la GPU, no necesitamos el temporal.
-                                        tempRenderPath = "";
+                                        tempRenderPath = ""; // La imagen de render ya fue generada
                                     }
                                 }
                                 catch (OperationCanceledException)
                                 {
                                     UpdateStatusCallback?.Invoke("Operación cancelada.", Drawing.Color.Orange);
-                                    WabiSabiLogger.Log("Exportación GPU cancelada por el usuario.", LogLevel.Info);
-                                    return; // Salir del método Execute
+                                    return;
                                 }
                                 catch (Exception ex)
                                 {
                                     UpdateStatusCallback?.Invoke($"Error en proceso GPU: {ex.Message}", Drawing.Color.Red);
-                                    WabiSabiLogger.LogError("Error durante la operación con ModernProgressDialog", ex);
-                                    return; // Salir del método Execute
+                                    return;
                                 }
                             }
                         }
-                        else // Si no es modo Alta/GPU, o si hay fallback
+                        else
                         {
-                            if (DepthQuality == 2 && !(UseGpuAcceleration && _gpuManager?.IsGpuAvailable == true))
-                            {
-                                UpdateStatusCallback?.Invoke("GPU no disponible, usando modo Normal.", Drawing.Color.Orange);
-                                useFallbackMode = true;
-                            }
-
-                            // Usar el modo apropiado según la calidad
+                            bool useFallbackMode = (DepthQuality == 2); // Usar fallback si era modo Alta pero sin GPU
                             int effectiveQuality = useFallbackMode ? 1 : DepthQuality;
 
                             _depthExtractorFast ??= new DepthExtractorFast(app, DepthResolution, effectiveQuality == 0 ? 4 : 2);
@@ -439,7 +383,6 @@ namespace WabiSabiBridge
                             _depthExtractorFast.UseGpuAcceleration = this.UseGpuAcceleration;
                             depthData = _depthExtractorFast.ExtractDepthMap(view3D, targetWidth, targetHeight, viewCorners);
                         }
-                        // --- FIN DE ACTUALIZACIÓN ---
                     }
                     catch (Exception ex)
                     {
@@ -448,7 +391,7 @@ namespace WabiSabiBridge
                     }
                 }
 
-                // --- TAREA 4: Crear y encolar el trabajo (sin cambios) ---
+                // --- TAREA 4: Crear y encolar el trabajo ---
                 var job = new ExportJob
                 {
                     TempRenderPath = tempRenderPath ?? "",
@@ -474,7 +417,6 @@ namespace WabiSabiBridge
                     EventHandler = this
                 };
 
-                // Solo encolar si hay algo que procesar
                 if (!string.IsNullOrEmpty(job.TempRenderPath) || job.DepthData != null)
                 {
                     WabiSabiBridgeApp._exportQueue.Enqueue(job);
@@ -699,9 +641,10 @@ namespace WabiSabiBridge
     public class WabiSabiBridgeWindow : WinForms.Form
     {
         private readonly UIApplication _uiApp;
-        private readonly ExternalEvent _externalEvent;
-        private readonly ExportEventHandler _eventHandler;
+        
+        
         private readonly WabiSabiConfig _config;
+        private bool _isHandlingAutoExportChange = false;
 
         private WinForms.TextBox _outputPathTextBox = null!;
         private WinForms.CheckBox _autoExportCheckBox = null!;
@@ -718,15 +661,20 @@ namespace WabiSabiBridge
         private WinForms.Label _statusLabel = null!;
         private WinForms.Label _cacheStatusLabel = null!;
         private WinForms.Button _clearCacheButton = null!;
+        private WinForms.ComboBox _geometryCacheQualityCombo = null!;
         private WinForms.Timer _cacheStatusTimer = null!;
         
-        public WabiSabiBridgeWindow(UIApplication uiApp, ExternalEvent externalEvent, ExportEventHandler eventHandler)
+        public WabiSabiBridgeWindow(UIApplication uiApp) // <-- Constructor nuevo y simplificado
         {
             _uiApp = uiApp;
-            _externalEvent = externalEvent;
-            _eventHandler = eventHandler;
-            _eventHandler.UpdateStatusCallback = UpdateStatus;
-            _config = WabiSabiConfig.Load();
+            _config = WabiSabiConfig.Load(); // Cargar la configuración
+            
+            // Ahora, para el status callback de la exportación MANUAL, lo asignamos directamente
+            if (WabiSabiBridgeApp.WabiSabiEventHandler != null)
+            {
+                WabiSabiBridgeApp.WabiSabiEventHandler.UpdateStatusCallback = UpdateStatus;
+            }
+
             InitializeComponent();
             CheckGpuStatus();
         }
@@ -913,7 +861,7 @@ namespace WabiSabiBridge
             {
                 Text = "Estado del Caché",
                 Location = new Drawing.Point(15, 355),
-                Size = new Drawing.Size(455, 80),
+                Size = new Drawing.Size(455, 115),
                 Font = new Drawing.Font("Segoe UI", 9F, Drawing.FontStyle.Bold)
             };
             
@@ -926,6 +874,25 @@ namespace WabiSabiBridge
                 Text = "Caché: No inicializado"
             };
             
+            var cacheQualityLabel = new WinForms.Label
+            {
+                Text = "Calidad de Geometría:",
+                Location = new Drawing.Point(15, 65),
+                Size = new Drawing.Size(120, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+
+            _geometryCacheQualityCombo = new WinForms.ComboBox
+            {
+                Location = new Drawing.Point(140, 65),
+                Size = new Drawing.Size(170, 25),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                DropDownStyle = WinForms.ComboBoxStyle.DropDownList
+            };
+            _geometryCacheQualityCombo.Items.AddRange(new object[] { "Baja (Más Rápida)", "Media (Equilibrada)", "Alta (Más Lenta)" });
+            _geometryCacheQualityCombo.SelectedIndex = _config.GeometryCacheQuality;
+
             _clearCacheButton = new WinForms.Button
             {
                 Text = "Limpiar",
@@ -941,13 +908,50 @@ namespace WabiSabiBridge
                 if (WinForms.MessageBox.Show("¿Limpiar el caché de geometría?\n\nEsto forzará la reconstrucción en la próxima exportación.",
                     "Confirmar limpieza", WinForms.MessageBoxButtons.YesNo, WinForms.MessageBoxIcon.Question) == WinForms.DialogResult.Yes)
                 {
-                    GeometryCacheManager.Instance.InvalidateCache();
-                    UpdateStatus("Caché limpiado", Drawing.Color.Orange);
-                    UpdateCacheStatus();
+                    // Asumimos que nuestro GeometryCacheManager ahora tiene un método para limpiar el disco
+                    GeometryCacheManager.Instance.ClearPersistentCache();
+                    
+                    UpdateStatus("Caché de disco limpiado", Drawing.Color.Orange);
+                    UpdateCacheStatus(); // Actualizar la UI
                 }
             };
+
+            var rebuildCacheButton = new WinForms.Button
+            {
+                Text = "Reconstruir",
+                Location = new Drawing.Point(245, 30), // Ajustar posición
+                Size = new Drawing.Size(95, 30),
+                Font = new Drawing.Font("Segoe UI", 9F),
+                BackColor = Drawing.Color.FromArgb(200, 220, 255),
+                FlatStyle = WinForms.FlatStyle.Flat,
+                Cursor = WinForms.Cursors.Hand
+            };
+            rebuildCacheButton.FlatAppearance.BorderSize = 0;
+            rebuildCacheButton.Click += async (s, e) => {
+                try
+                {
+                    UpdateStatus("Forzando reconstrucción de caché...", Drawing.Color.Blue);
+                    // Invalidamos el caché primero
+                    GeometryCacheManager.Instance.InvalidateCache();
+                    
+                    // Luego llamamos a EnsureCacheIsValid para forzar la reconstrucción
+                    var doc = _uiApp.ActiveUIDocument.Document;
+                    var view3D = doc.ActiveView as View3D;
+                    if (view3D != null)
+                    {
+                        await GeometryCacheManager.Instance.EnsureCacheIsValidAsync(doc, view3D, UpdateStatus);
+                    }
+                    UpdateCacheStatus();
+                    UpdateStatus("Caché reconstruido.", Drawing.Color.Green);
+                }
+                catch (Exception ex)
+                {
+                    UpdateStatus($"Error reconstruyendo: {ex.Message}", Drawing.Color.Red);
+                }
+            };
+
+            cacheGroup.Controls.AddRange(new WinForms.Control[] {  _cacheStatusLabel, _clearCacheButton, rebuildCacheButton, cacheQualityLabel, _geometryCacheQualityCombo });      
             
-            cacheGroup.Controls.AddRange(new WinForms.Control[] { _cacheStatusLabel, _clearCacheButton });
             
             // === SECCIÓN 4: Opciones adicionales ===
             var additionalGroup = new WinForms.GroupBox
@@ -1087,24 +1091,62 @@ namespace WabiSabiBridge
                 UpdateTimeEstimate();
             };
             
-            _autoExportCheckBox.CheckedChanged += (s, e) => {
-                // 1. Actualizar y guardar la configuración como antes
-                _config.AutoExport = _autoExportCheckBox.Checked;
-                _config.Save();
+            _autoExportCheckBox.CheckedChanged += async (s, e) =>
+            {
+                // --- INICIO DE CIRUGÍA 2: CORREGIR LA LLAMADA AL MÉTODO ---
 
-                // 2. AVISAR AL SISTEMA EN TIEMPO REAL (ESTA ES LA LÍNEA CLAVE)
-                // Se le pasa el nuevo estado (activado/desactivado) y la instancia de la aplicación de Revit.
-                WabiSabiBridgeApp.SetAutoExportEnabled(_autoExportCheckBox.Checked, _uiApp);
+                // Usar el guardia para evitar que el evento se ejecute a sí mismo.
+                if (_isHandlingAutoExportChange) return;
 
-                // 3. (Opcional) Informar al usuario en la barra de estado
-                if (_autoExportCheckBox.Checked)
+                _isHandlingAutoExportChange = true;
+                try
                 {
-                    UpdateStatus("Auto-export activado. Mueve la cámara.", Drawing.Color.Green);
+                    // Guardar la configuración del usuario inmediatamente.
+                    _config.AutoExport = _autoExportCheckBox.Checked;
+                    _config.Save();
+
+                    if (_autoExportCheckBox.Checked)
+                    {
+                        // El usuario quiere ACTIVAR el servicio.
+                        UpdateStatus("Iniciando auto-export optimizado...", Drawing.Color.Blue);
+
+                        var doc = _uiApp.ActiveUIDocument.Document;
+                        var view3D = doc.ActiveView as View3D;
+
+                        if (view3D != null && WabiSabiBridgeApp.AutoExportManager != null)
+                        {
+                            // Llamada corregida: Pasamos _uiApp en lugar de uiView.
+                            await WabiSabiBridgeApp.AutoExportManager.StartAutoExport(_uiApp, doc, view3D);
+                            UpdateStatus("Auto-export activo (Modo Caché/GPU)", Drawing.Color.Green);
+                        }
+                        else
+                        {
+                            throw new InvalidOperationException("Se requiere una vista 3D activa para iniciar el auto-export.");
+                        }
+                    }
+                    else
+                    {
+                        // El usuario quiere DESACTIVAR el servicio.
+                        UpdateStatus("Deteniendo auto-export...", Drawing.Color.Orange);
+                        // Llamar al gestor estático para detener la operación.
+                        WabiSabiBridgeApp.AutoExportManager?.StopAutoExport();
+                        UpdateStatus("Auto-export desactivado", Drawing.Color.Orange);
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    UpdateStatus("Auto-export desactivado.", Drawing.Color.Orange);
+                    // Si cualquier parte del proceso de activación falla...
+                    UpdateStatus($"Error al iniciar auto-export: {ex.Message}", Drawing.Color.Red);
+                    
+                    // ...se asegura que el checkbox refleje el estado real (desactivado).
+                    _autoExportCheckBox.Checked = false;
                 }
+                finally
+                {
+                    // Liberar el guardia para permitir futuros clics del usuario.
+                    _isHandlingAutoExportChange = false;
+                }
+                
             };
             
             _autoDepthCheckBox.CheckedChanged += (s, e) => {
@@ -1132,6 +1174,14 @@ namespace WabiSabiBridge
             _depthRangeTrackBar.MouseUp += (s, e) => {
                 _config.Save();
             };
+
+            _geometryCacheQualityCombo.SelectedIndexChanged += (s, e) => {
+            _config.GeometryCacheQuality = _geometryCacheQualityCombo.SelectedIndex;
+            _config.Save();
+            // Forzar la reconstrucción en la próxima exportación al cambiar la calidad
+            GeometryCacheManager.Instance.InvalidateCache();
+            UpdateCacheStatus();
+        };
             
             // Timer para actualizar el estado del caché
             _cacheStatusTimer = new WinForms.Timer { Interval = 1000 };
@@ -1152,23 +1202,39 @@ namespace WabiSabiBridge
             {
                 if (InvokeRequired) { Invoke(new Action(ExportCurrentView)); return; }
             
-                UpdateStatus("Preparando exportación...", Drawing.Color.Blue);
+                UpdateStatus("Preparando exportación manual...", Drawing.Color.Blue);
                 
-                _eventHandler.OutputPath = _outputPathTextBox.Text;
-                _eventHandler.UiApp = _uiApp;
-                _eventHandler.ExportDepth = _exportDepthCheckBox.Checked;
-                _eventHandler.DepthResolution = _config.DepthResolution;
-                _eventHandler.DepthQuality = _config.DepthQuality;
-                _eventHandler.AutoDepthRange = _autoDepthCheckBox.Checked;
-                _eventHandler.DepthRangeDistance = _depthRangeTrackBar.Value;
-                _eventHandler.UseGpuAcceleration = _gpuAccelerationCheckBox.Checked;
-                _eventHandler.UseGeometryExtraction = _geometryExtractionCheckBox.Checked;
-                _eventHandler.SaveTimestampedRender = _config.SaveTimestampedRender;
-                _eventHandler.SaveTimestampedDepth = _config.SaveTimestampedDepth;
+                // --- INICIO DE CIRUGÍA 2: USAR LOS HANDLERS ESTÁTICOS ---
+                
+                // Obtenemos la referencia al handler estático de la aplicación principal
+                var handler = WabiSabiBridgeApp.WabiSabiEventHandler;
+                if (handler is null)
+                {
+                    UpdateStatus("Error: El manejador de exportación no está inicializado.", Drawing.Color.Red);
+                    return;
+                }
 
-                _externalEvent.Raise();
+                // Configuramos el handler con los valores actuales de la UI
+                handler.OutputPath = _outputPathTextBox.Text;
+                handler.ExportDepth = _exportDepthCheckBox.Checked;
+                handler.DepthResolution = _config.DepthResolution;
+                handler.DepthQuality = _config.DepthQuality;
+                handler.AutoDepthRange = _autoDepthCheckBox.Checked;
+                handler.DepthRangeDistance = _depthRangeTrackBar.Value;
+                handler.UseGpuAcceleration = _gpuAccelerationCheckBox.Checked;
+                handler.UseGeometryExtraction = _geometryExtractionCheckBox.Checked;
+                handler.SaveTimestampedRender = _config.SaveTimestampedRender;
+                handler.SaveTimestampedDepth = _config.SaveTimestampedDepth;
+
+                // Disparamos el evento estático de la aplicación principal
+                WabiSabiBridgeApp.WabiSabiEvent?.Raise();
+                
+                // --- FIN DE CIRUGÍA 2 ---
             }
-            catch (Exception ex) { UpdateStatus($"Error: {ex.Message}", Drawing.Color.Red); }
+            catch (Exception ex) 
+            { 
+                UpdateStatus($"Error: {ex.Message}", Drawing.Color.Red); 
+            }
         }
 
         #region Métodos de la UI
@@ -1183,15 +1249,25 @@ namespace WabiSabiBridge
             if (!_gpuAccelerationCheckBox.Checked) _geometryExtractionCheckBox.Checked = false;
             UpdateTimeEstimate();
         }
-        private void CheckGpuStatus() {
-            try {
-                using var gpuManager = new GpuAccelerationManager(this);
-                // CAMBIO: Se usa coincidencia de patrones para hacer el código más compacto.
-                if(Controls.Find("gpuStatusLabel", true).FirstOrDefault() is WinForms.Label gpuStatusLabel) {
+        private void CheckGpuStatus()
+        {
+            try
+            {
+                // --- INICIO DE CIRUGÍA ---
+                // 1. Obtener la referencia al gestor de GPU único y estático. NO crear uno nuevo.
+                var gpuManager = WabiSabiBridgeApp.GpuManager;
+
+                // 2. Comprobar que el control de la UI y el gestor existen.
+                if (Controls.Find("gpuStatusLabel", true).FirstOrDefault() is WinForms.Label gpuStatusLabel && gpuManager != null)
+                {
+                    // 3. Usar la propiedad IsGpuAvailable del gestor estático.
                     gpuStatusLabel.Text = gpuManager.IsGpuAvailable ? "GPU: Disponible ✓" : "GPU: No disponible (usando CPU paralela)";
                     gpuStatusLabel.ForeColor = gpuManager.IsGpuAvailable ? Drawing.Color.Green : Drawing.Color.Orange;
                 }
-            } catch (Exception ex) {
+                // --- FIN DE CIRUGÍA ---
+            }
+            catch (Exception ex)
+            {
                 Autodesk.Revit.UI.TaskDialog.Show("Error de GPU", $"Error al verificar GPU: {ex}");
             }
         }
@@ -1226,17 +1302,18 @@ namespace WabiSabiBridge
         }
         private void UpdateCacheStatus() {
             try {
-                var cacheManager = GeometryCacheManager.Instance;
-                if (cacheManager.IsCacheValid) {
-                    string sizeInfo = cacheManager.CacheSizeBytes > 1048576 ? $"{cacheManager.CacheSizeBytes / 1048576.0:F1}MB" : $"{cacheManager.CacheSizeBytes / 1024.0:F1}KB";
-                    var elapsed = DateTime.Now - cacheManager.LastCacheTime;
-                    string timeAgo = elapsed.TotalSeconds < 60 ? "hace un momento" : elapsed.TotalMinutes < 60 ? $"hace {(int)elapsed.TotalMinutes} min" : $"hace {(int)elapsed.TotalHours} h";
-                    _cacheStatusLabel.Text = $"Caché: Válido ({cacheManager.VertexCount:N0} V, {cacheManager.TriangleCount:N0} T, {sizeInfo}) - {timeAgo}";
-                    _cacheStatusLabel.ForeColor = Drawing.Color.Green; _clearCacheButton.Enabled = true;
+                // --- INICIO DE CIRUGÍA 2.2: OBTENER ESTADÍSTICAS DEL GESTOR ---
+                var stats = GeometryCacheManager.Instance.GetStatistics();
+                if (stats.IsValid) {
+                    _cacheStatusLabel.Text = $"Caché: Válido ({stats.VertexCount:N0} V) - Hit Rate: {stats.HitRate:P1}";
+                    _cacheStatusLabel.ForeColor = Drawing.Color.Green;
+                    _clearCacheButton.Enabled = true;
                 } else {
-                    _cacheStatusLabel.Text = "Caché: No válido (se reconstruirá autom.)";
-                    _cacheStatusLabel.ForeColor = Drawing.Color.Gray; _clearCacheButton.Enabled = false;
+                    _cacheStatusLabel.Text = "Caché: No válido (se reconstruirá)";
+                    _cacheStatusLabel.ForeColor = Drawing.Color.Gray;
+                    _clearCacheButton.Enabled = true; // Permitir limpiar incluso si no es válido
                 }
+                // --- FIN DE CIRUGÍA 2.2 ---
             } catch { _cacheStatusLabel.Text = "Caché: Estado desconocido"; }
         }
         private void UpdateStatus(string message, Drawing.Color color) {
@@ -1245,7 +1322,7 @@ namespace WabiSabiBridge
         }
         protected override void OnFormClosing(WinForms.FormClosingEventArgs e) {
             _cacheStatusTimer.Stop(); _cacheStatusTimer.Dispose();
-            _eventHandler.Dispose();
+           
             base.OnFormClosing(e);
         }
         #endregion
@@ -1260,35 +1337,26 @@ namespace WabiSabiBridge
     /// </summary>
     public class WabiSabiBridgeApp : IExternalApplication
     {
-        // --- SECCIÓN 1: Eventos y Handlers Principales de la Aplicación ---
+        // --- CAMPOS DEFINITIVOS ---
+        private const double XYZ_TOLERANCE = 1e-6;
+        internal static LockFreeCameraRingBuffer? _cameraBuffer;
+        internal static long _lastProcessedSequenceNumber = -1;
+        internal static int _globalSequenceNumber = 0;
+        public static string RevitVersion { get; private set; } = string.Empty;
+        private static UIApplication? _currentUiApp;
+        private static ViewOrientation3D? _lastKnownOrientation; 
+        // 1. Para la exportación MANUAL (desencadenada por el botón de la UI)
         internal static ExternalEvent? WabiSabiEvent;
         internal static ExportEventHandler? WabiSabiEventHandler;
+        internal static GpuAccelerationManager? GpuManager;
+        // 2. Para la exportación AUTOMÁTICA (gestionada enteramente por esta clase)
+        internal static OptimizedAutoExportManager? AutoExportManager;
+
+        // 3. Configuración y estado global de la aplicación
         private static readonly WabiSabiConfig _config = WabiSabiConfig.Load();
-        private static UIApplication? _currentUiApp;
         private static bool _isInitialized = false;
 
-        // --- SECCIÓN 2: Sistema de Sondeo de Cámara (La Nueva Arquitectura) ---
-        
-        internal static LockFreeCameraRingBuffer? _cameraBuffer;
-        private static Task? _consumerTask;
-        private static CancellationTokenSource? _consumerCts;
-        private static JournalMonitor? _journalMonitor;
-        public static string RevitVersion { get; private set; } = "2026";
-
-        // --- SECCIÓN 3: Lógica de Auto-Export (Controlada por OnIdling) ---
-        private static bool _isContinuousCaptureActive = false;
-        internal static int _globalSequenceNumber = -1; // internal permite el acceso desde el mismo ensamblado
-        internal static int _lastProcessedSequenceNumber = -1;
-        private static long _lastCameraMoveTimestamp = 0;
-        // --- INICIO DE CIRUGÍA 1: AÑADIR TIMESTAMP DEL LIMITADOR ---
-        private static long _lastFrameTimestamp = 0;
-        // Intervalo de exportación en milisegundos. 1000ms / 12 FPS = ~83ms
-        private const long EXPORT_INTERVAL_MS = 83; 
-        private static ViewOrientation3D? _lastKnownOrientation; // Podría vivir en el handler, pero aquí es aceptable
-        private static readonly double XYZ_TOLERANCE = 1e-6;
-        private static volatile bool _pollingRequested = false;
-
-        // --- SECCIÓN 4: Sistema de Cola de Exportación (Para Procesamiento en Segundo Plano) ---
+        // 4. Hilo de trabajo para procesar la cola de guardado de archivos
         internal static readonly ConcurrentQueue<ExportJob> _exportQueue = new ConcurrentQueue<ExportJob>();
         private static Task? _exportWorker;
         private static CancellationTokenSource? _exportCts;
@@ -1300,40 +1368,97 @@ namespace WabiSabiBridge
         {
             try
             {
-                WabiSabiLogger.Log("========================================", LogLevel.Info);
                 WabiSabiLogger.Log("WabiSabi Bridge - INICIANDO", LogLevel.Info);
-                WabiSabiLogger.Log($"Versión: v0.3.3 Fixed", LogLevel.Info);
-                WabiSabiLogger.Log("========================================", LogLevel.Info);
-                
-                _isInitialized = false;
-                
-                if (!CreateRibbon(application)) return Result.Failed;
-                if (!InitializeEventHandler()) return Result.Failed;
-                
-
-                
-                
                 RevitVersion = application.ControlledApplication.VersionNumber;
-                _cameraBuffer = new LockFreeCameraRingBuffer(128);
-                _journalMonitor = new JournalMonitor(_cameraBuffer);
-                WabiSabiLogger.Log("Sistema JournalMonitor inicializado.", LogLevel.Info);
+            
+                WabiSabiLogger.Log($"WabiSabi Bridge - INICIANDO (Revit {RevitVersion})", LogLevel.Info);
+                GpuManager = new GpuAccelerationManager(); 
+                WabiSabiLogger.Log($"Gestor de GPU inicializado. Disponible: {GpuManager.IsGpuAvailable}", LogLevel.Info);
+                // 1. Inicializar componentes básicos de Revit
+                if (!CreateRibbon(application)) return Result.Failed;
+                if (!InitializeEventHandler()) return Result.Failed; // Para la exportación manual
 
-                
-                // INICIAR EL HILO CONSUMIDOR DE EXPORTACIONES
+                // 2. Crear el gestor de auto-exportación. Se quedará a la espera.
+                string cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WabiSabiBridge", "GeometryCache");
+                AutoExportManager = new OptimizedAutoExportManager(cacheDir);
+
+                // 3. Suscribirse a eventos de Revit para la invalidación automática del caché
+                application.ControlledApplication.DocumentChanged += OnDocumentChanged;
+                application.ControlledApplication.DocumentOpened += OnDocumentOpened;
+
+                // 4. Iniciar el hilo de trabajo para guardar archivos
                 _exportCts = new CancellationTokenSource();
                 _exportWorker = Task.Run(() => ProcessExportQueue(_exportCts.Token));
-                WabiSabiLogger.Log("Hilo de trabajo de exportación iniciado.", LogLevel.Info);
-
+                
                 _isInitialized = true;
-                //RunDiagnostics();
+                WabiSabiLogger.Log("Plugin inicializado y listo.", LogLevel.Info);
                 return Result.Succeeded;
             }
             catch (Exception ex)
             {
-                WabiSabiLogger.LogError("Error crítico en OnStartup", ex);
-                TaskDialog.Show("Error Crítico WabiSabi", $"Error durante inicio: {ex.Message}");
+                WabiSabiLogger.LogError("Error fatal en OnStartup", ex);
                 return Result.Failed;
             }
+        }
+
+        public Result OnShutdown(UIControlledApplication application)
+        {
+            try
+            {
+                WabiSabiLogger.Log("WabiSabi Bridge - CERRANDO", LogLevel.Info);
+
+                // Detener el gestor de auto-exportación si está corriendo
+                AutoExportManager?.StopAutoExport();
+
+                // Detener el hilo de guardado de archivos
+                _exportCts?.Cancel();
+                _exportWorker?.Wait(TimeSpan.FromSeconds(2));
+
+                // Desuscribirse de los eventos
+                application.ControlledApplication.DocumentChanged -= OnDocumentChanged;
+                application.ControlledApplication.DocumentOpened -= OnDocumentOpened;
+
+                GpuManager?.Dispose();
+                return Result.Succeeded;
+            }
+            catch (Exception ex)
+            {
+                WabiSabiLogger.LogError("Error en OnShutdown", ex);
+                return Result.Failed;
+            }
+        }
+
+        /// <summary>
+        /// Se ejecuta cuando el documento cambia. Invalida el caché.
+        /// </summary>
+        private void OnDocumentChanged(object sender, DocumentChangedEventArgs e)
+        {
+            // Una detección de cambio simple es suficiente
+            if (e.GetAddedElementIds().Any() || e.GetDeletedElementIds().Any() || e.GetModifiedElementIds().Any())
+            {
+                WabiSabiLogger.Log("Cambios en el modelo detectados, invalidando caché.", LogLevel.Info);
+                GeometryCacheManager.Instance.InvalidateCache();
+
+                // Opcional: Si el auto-export está activo, podemos pedirle que reconstruya el caché.
+                if (AutoExportManager != null && AutoExportManager.IsRunning)
+                {
+                    var doc = e.GetDocument();
+                    var activeView = doc.ActiveView as View3D;
+                    if (activeView != null)
+                    {
+                        _ = AutoExportManager.OnModelChanged(doc, activeView);
+                    }
+                }
+            }
+        }
+
+        /// <summary>
+        /// Se ejecuta al abrir un documento. Invalida cualquier caché antiguo.
+        /// </summary>
+        private void OnDocumentOpened(object sender, DocumentOpenedEventArgs e)
+        {
+            WabiSabiLogger.Log("Documento abierto, invalidando caché.", LogLevel.Info);
+            GeometryCacheManager.Instance.InvalidateCache();
         }
 
         private static async Task ConsumerLoop(CancellationToken token)
@@ -1491,41 +1616,8 @@ namespace WabiSabiBridge
             }
         }
 
-        public string GetName() => "WabiSabi Bridge Export Event";
-               
-        /// <summary>
-        /// Activa o desactiva dinámicamente el sistema de streaming para la exportación automática.
-        /// </summary>
-        public static void SetAutoExportEnabled(bool enabled, UIApplication? uiApp)
-        {
-            WabiSabiLogger.Log($"SetAutoExportEnabled (Arquitectura 3 Hilos) llamado con: {enabled}", LogLevel.Info);
-            _config.AutoExport = enabled;
-            _config.Save();
-            _isContinuousCaptureActive = enabled;
-
-            if (enabled)
-            {
-                // Reiniciar contadores
-                _lastProcessedSequenceNumber = -1;
-                _globalSequenceNumber = -1;
-
-                // Iniciar el Productor
-                _journalMonitor?.Start();
-
-                // --- INICIO DE CIRUGÍA 3.1: INICIAR EL CONSUMIDOR ---
-                _consumerCts?.Cancel(); // Cancelar cualquier tarea anterior
-                _consumerCts?.Dispose();
-                _consumerCts = new CancellationTokenSource();
-                _consumerTask = Task.Run(() => ConsumerLoop(_consumerCts.Token), _consumerCts.Token);
-                // --- FIN DE CIRUGÍA 3.1 ---
-            }
-            else
-            {
-                // Detener ambos hilos
-                _journalMonitor?.Stop();
-                _consumerCts?.Cancel();
-            }
-        }   
+        public string GetName() => "WabiSabi Bridge Export Event";              
+          
 
         /// <summary>
         /// Invalida una región mínima de la vista para forzar redibujado
@@ -1688,13 +1780,6 @@ namespace WabiSabiBridge
             }
         }       
 
-        
-        private void OnIdling(object? sender, IdlingEventArgs e)
-        {
-           
-        }
-
-
         /// <summary>
         /// --- MÉTODO DE PROCESAMIENTO INTELIGENTE ---
         /// </summary>
@@ -1762,35 +1847,7 @@ namespace WabiSabiBridge
             {
                 WabiSabiLogger.LogError("Error en TriggerAutoExport", ex);
             }
-        }
-
-        
-
-        public Result OnShutdown(UIControlledApplication application)
-        {
-            try
-            {
-                WabiSabiLogger.Log("WabiSabi Bridge - CERRANDO", LogLevel.Info);
-                _journalMonitor?.Stop();
-                // Detener el hilo metrónomo de sondeo de cámara
-                ;
-                
-                // Detener el hilo consumidor de exportaciones
-                _exportCts?.Cancel();
-                _exportWorker?.Wait(TimeSpan.FromSeconds(2));
-                
-                // Liberar recursos de los handlers
-                WabiSabiEventHandler?.Dispose();
-                
-                WabiSabiLogger.Log("WabiSabi Bridge cerrado correctamente", LogLevel.Info);
-                return Result.Succeeded;
-            }
-            catch (Exception ex)
-            {
-                WabiSabiLogger.LogError("Error en OnShutdown", ex);
-                return Result.Failed;
-            }
-        }
+        }       
 
         private void CleanupNonStreamingResources()
         {
@@ -1815,37 +1872,49 @@ namespace WabiSabiBridge
 
         internal static string RunDiagnostics()
         {
-            var diag = new System.Text.StringBuilder();
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("=== Diagnóstico del Sistema WabiSabi Bridge ===");
             
-            diag.AppendLine($"Estado del sistema WabiSabi:");
-            diag.AppendLine($"- Inicializado: {_isInitialized}");
-            diag.AppendLine($"- EventHandler (Export): {(WabiSabiEventHandler != null ? "OK" : "NULL")}");
-            diag.AppendLine($"- Event (Export): {(WabiSabiEvent != null ? "OK" : "NULL")}");
+            // 1. Estado de la Aplicación Principal
+            sb.AppendLine("\n--- Estado General ---");
+            sb.AppendLine($"- Plugin Inicializado: {_isInitialized}");
+            sb.AppendLine($"- Handler de Exportación Manual: {(WabiSabiEventHandler != null ? "Cargado" : "Error")}");
             
-            diag.AppendLine("\n--- Sistema de Sondeo de Cámara ---");
-            
-            
-            
-            diag.AppendLine($"- CameraBuffer: {(_cameraBuffer != null ? "OK" : "NULL")}");
-            
-            diag.AppendLine("\n--- Estado de Auto-Export ---");
-            diag.AppendLine($"- Config.AutoExport: {_config.AutoExport}");
-            diag.AppendLine($"- Captura continua activa (flag): {_isContinuousCaptureActive}");
-            diag.AppendLine($"- Último Seq. Global: {_globalSequenceNumber}");
-            diag.AppendLine($"- Último Seq. Procesada: {_lastProcessedSequenceNumber}");
+            // 2. Estado del Gestor de Auto-Exportación
+            sb.AppendLine("\n--- Gestor de Auto-Exportación ---");
+            if (AutoExportManager != null)
+            {
+                var stats = AutoExportManager.GetStatistics(); // Suponiendo que tienes este método
+                sb.AppendLine($"- Estado: {(stats.IsRunning ? "Corriendo" : "Detenido")}");
+                sb.AppendLine($"- Modo: {stats.CurrentMode}");
+                sb.AppendLine($"- FPS Objetivo: {stats.TargetFPS}");
+            }
+            else
+            {
+                sb.AppendLine("- Estado: No inicializado");
+            }
 
-            diag.AppendLine("\n--- Sistema de Cola de Exportación ---");
-            diag.AppendLine($"- Tarea de Exportación (Worker): {(_exportWorker != null && !_exportWorker.IsCompleted ? "Corriendo" : "Detenida")}");
-            diag.AppendLine($"- Trabajos en cola: {_exportQueue.Count}");
+            // 3. Estado del Caché de Geometría
+            sb.AppendLine("\n--- Caché de Geometría ---");
+            try
+            {
+                var cacheStats = GeometryCacheManager.Instance.GetStatistics();
+                sb.AppendLine($"- Estado del Caché: {(cacheStats.IsValid ? "Válido" : "Inválido")}");
+                sb.AppendLine($"  - Vértices: {cacheStats.VertexCount:N0}");
+                sb.AppendLine($"  - Triángulos: {cacheStats.TriangleCount:N0}");
+                sb.AppendLine($"  - Tamaño: {cacheStats.GetFormattedSize()}");
+                sb.AppendLine($"  - Tasa de Aciertos: {cacheStats.HitRate:P1} ({cacheStats.CacheHits} hits, {cacheStats.CacheMisses} misses)");
+            }
+            catch (Exception ex)
+            {
+                sb.AppendLine($"- Error al obtener estadísticas del caché: {ex.Message}");
+            }
 
-            string result = diag.ToString();
-            WabiSabiLogger.Log("=== DIAGNÓSTICO ===\n" + result, LogLevel.Info);
-            
+            string result = sb.ToString();
+            WabiSabiLogger.Log(result, LogLevel.Info);
             return result;
         }
-        
     }
-    
     #endregion
 
     #region Clase de Configuración (Corregida)
@@ -1871,6 +1940,7 @@ namespace WabiSabiBridge
         public bool UseGeometryExtraction { get; set; } = false;
         public bool SaveTimestampedRender { get; set; } = true;
         public bool SaveTimestampedDepth { get; set; } = true;
+        public int GeometryCacheQuality { get; set; } = 1; // 0=Baja, 1=Media, 2=Alta
 
         // Constructor por defecto
         public WabiSabiConfig()
@@ -2061,6 +2131,11 @@ namespace WabiSabiBridge
                 if (string.IsNullOrWhiteSpace(_outputPath) || !IsValidPath(_outputPath))
                 {
                     _outputPath = GetDefaultOutputPath();
+                }
+
+                if (GeometryCacheQuality < 0 || GeometryCacheQuality > 2)
+                {
+                    GeometryCacheQuality = 1; // Default a Media
                 }
 
                 Debug.WriteLine("[WabiSabiConfig] Configuración validada y corregida.");

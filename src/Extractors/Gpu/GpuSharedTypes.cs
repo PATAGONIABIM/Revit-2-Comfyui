@@ -17,19 +17,8 @@ namespace WabiSabiBridge.Extractors.Gpu
         void WriteGeometryData(float[] vertices, int[] indices, float[] normals);
         Task<float[]> ExecuteDepthRayTracingAsync(ExtractedGeometry geometry, RayTracingConfig config);
         
-        // NUEVO: Método optimizado que usa el caché directamente
-        Task<float[]> ExecuteDepthRayTracingFromCacheAsync(
-            MemoryMappedFile cacheFile, 
-            int vertexCount, 
-            int triangleCount, 
-            RayTracingConfig config);
-
-        // NUEVO: Método para ejecutar el renderizado de líneas en la GPU
-        Task<float[]> ExecuteLineRenderAsync(
-            MemoryMappedFile cacheFile,
-            int vertexCount,
-            int triangleCount,
-            RayTracingConfig config);
+        Task<float[]> ExecuteDepthRayTracingFromCacheAsync(string mmfName, int vertexCount, int triangleCount, RayTracingConfig config);
+        Task<float[]> ExecuteLineRenderAsync(string mmfName, int vertexCount, int triangleCount, RayTracingConfig config);
     }
     
     /// <summary>
