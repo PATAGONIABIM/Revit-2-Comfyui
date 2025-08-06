@@ -120,9 +120,7 @@ bool JournalParser::ParseCameraDirective(const std::string& content, JournalCame
     
     if (std::regex_search(content, match, cameraRegex)) {
         try {
-            // --- INICIO DE LA CORRECCIÓN ---
-            // Paso 1: Leer las coordenadas del journal en el sistema de Revit (Z-up)
-            // El journal las escribe en orden Y, Z, X
+            // --- SIN CAMBIOS EN ESTA LÓGICA DE COORDENADAS ---
             float eye_revit_x = std::stof(match[3].str());
             float eye_revit_y = std::stof(match[1].str());
             float eye_revit_z = std::stof(match[2].str());
@@ -135,14 +133,10 @@ bool JournalParser::ParseCameraDirective(const std::string& content, JournalCame
             float up_revit_y = std::stof(match[7].str());
             float up_revit_z = std::stof(match[8].str());
 
-            // Paso 2: Transformar de sistema Z-up a Y-up para el renderizador
-            // new_x = old_x
-            // new_y = old_z
-            // new_z = -old_y
             cameraData.eyePosition = make_float3(eye_revit_x, eye_revit_y, eye_revit_z);
-            cameraData.targetPosition = make_float3(target_revit_x, target_revit_y, target_revit_z); // <-- Usando el miembro nuevo y correcto
+            cameraData.targetPosition = make_float3(target_revit_x, target_revit_y, target_revit_z);
             cameraData.upDirection = make_float3(up_revit_x, up_revit_y, up_revit_z);
-            // --- FIN DE LA CORRECCIÓN ---
+            // --- FIN DE LA LÓGICA DE COORDENADAS ---
             
             cameraData.timestamp = std::chrono::high_resolution_clock::now().time_since_epoch().count();
             cameraData.sequenceNumber = globalSequenceNumber.fetch_add(1);
@@ -197,46 +191,47 @@ void JournalParser::ProcessInitialCamera(std::function<void(const JournalCameraD
 
     std::cout << "[JOURNAL] Buscando posición de cámara inicial..." << std::endl;
 
-    // Guardar la posición final actual para restaurarla después
     std::streampos endPosition = journalFile.tellg();
-
-    // Ir al principio del archivo
     journalFile.seekg(0, std::ios::beg);
-
-    // Leer todo el contenido del archivo
     std::string content(
         (std::istreambuf_iterator<char>(journalFile)),
         std::istreambuf_iterator<char>()
     );
 
-    // --- LÓGICA MEJORADA PARA ENCONTRAR LA ÚLTIMA CÁMARA ---
-    // Usamos un iterador de regex para encontrar todas las coincidencias
-    auto matches_begin = std::sregex_iterator(content.begin(), content.end(), cameraRegex);
-    auto matches_end = std::sregex_iterator();
-
-    JournalCameraData lastValidCamera;
+    // --- INICIO DE LA LÓGICA CORREGIDA ---
+    // En lugar de usar sregex_iterator en todo el archivo (lo que causa el error de complejidad),
+    // usamos una búsqueda de texto rápida para encontrar la última directiva y la parseamos.
+    
     bool foundCamera = false;
+    // 1. Buscar la última aparición de la clave "Jrn.Directive".
+    size_t lastDirectivePos = content.rfind("Jrn.Directive");
 
-    // Iteramos a través de todas las coincidencias y nos quedamos con la última
-    for (std::sregex_iterator i = matches_begin; i != matches_end; ++i) {
+    while (lastDirectivePos != std::string::npos) {
+        // 2. Extraer el fragmento de texto desde esa posición hasta el final.
+        std::string snippet = content.substr(lastDirectivePos);
+        
         JournalCameraData tempCamera;
-        if (ParseCameraDirective((*i).str(), tempCamera)) {
-            lastValidCamera = tempCamera;
+        // 3. Intentar parsear este fragmento. La expresión regular ahora opera en un texto pequeño.
+        if (ParseCameraDirective(snippet, tempCamera)) {
+            // Si tiene éxito, hemos encontrado la última cámara válida.
+            std::cout << "[JOURNAL] Última cámara válida encontrada y procesada." << std::endl;
+            onCameraUpdate(tempCamera);
             foundCamera = true;
+            break; // Salimos del bucle.
         }
+        
+        // 4. Si falla (quizás era otra directiva), buscamos la aparición anterior.
+        if (lastDirectivePos == 0) break; // Evitar bucle infinito
+        lastDirectivePos = content.rfind("Jrn.Directive", lastDirectivePos - 1);
     }
-
-    if (foundCamera) {
-        std::cout << "[JOURNAL] Última cámara válida encontrada y procesada." << std::endl;
-        onCameraUpdate(lastValidCamera);
-    } else {
+    
+    if (!foundCamera) {
         std::cout << "[JOURNAL] ADVERTENCIA: No se encontró ninguna directiva de cámara válida en el journal." << std::endl;
         std::cout << "[JOURNAL] El renderizador esperará a que se mueva la cámara en Revit." << std::endl;
     }
-    // --- FIN DE LA LÓGICA MEJORADA ---
+    // --- FIN DE LA LÓGICA CORREGIDA ---
 
-    // Restaurar el puntero del archivo al final para que WatchLoop funcione correctamente
-    journalFile.clear(); // Limpiar flags de eof
+    journalFile.clear(); 
     journalFile.seekg(endPosition);
     lastPosition = journalFile.tellg();
 }
