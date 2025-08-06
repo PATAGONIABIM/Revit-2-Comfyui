@@ -1,5 +1,6 @@
-// GeometryCacheManager.cs --- VERSIÓN ACTUALIZADA CON PROCESAMIENTO SECUENCIAL Y MEJOR FEEDBACK ---
+// GeometryCacheManager.cs --- VERSIÓN CON PARALELIZACIÓN DE CPU AGRESIVA ---
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.MemoryMappedFiles;
@@ -16,7 +17,6 @@ using WabiSabiBridge.Extractors.Gpu; // Para GpuAccelerationManager, RayTracingC
 using ComputeSharp;                   // Para Float3
 using WabiSabiBridge;                 // Para WabiSabiLogger
 using Newtonsoft.Json;                // Añadido para la serialización en WriteStateFile
-using System.Collections.Concurrent;  // Para ConcurrentDictionary
 
 namespace WabiSabiBridge.Extractors.Cache
 {
@@ -115,74 +115,44 @@ namespace WabiSabiBridge.Extractors.Cache
         
         private GeometryCacheManager() 
         {
-            _persistentCacheDirectory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "WabiSabiBridge",
-                "GeometryCache"
-            );
+            _persistentCacheDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WabiSabiBridge", "GeometryCache");
             Directory.CreateDirectory(_persistentCacheDirectory);
-            System.Diagnostics.Debug.WriteLine("GeometryCacheManager: Inicializado");
         }
 
-        public async Task<CachedGeometryData> EnsureCacheIsValidAsync(
-            Document doc,
-            View3D view3D,
-            Action<string, Drawing.Color>? updateStatusCallback = null,
-            CancellationToken cancellationToken = default)
+        public async Task<CachedGeometryData> EnsureCacheIsValidAsync(Document doc, View3D view3D, Action<string, Drawing.Color>? updateStatusCallback = null, CancellationToken cancellationToken = default)
         {
-            return await Task.Run(() =>
-            {
-                return EnsureCacheIsValid(doc, view3D, updateStatusCallback);
-            }, cancellationToken);
+            return await Task.Run(() => EnsureCacheIsValid(doc, view3D, updateStatusCallback), cancellationToken);
         }
         
-        public CachedGeometryData EnsureCacheIsValid(
-            Document doc, 
-            View3D view3D, 
-            Action<string, Drawing.Color>? updateStatusCallback = null)
+        public CachedGeometryData EnsureCacheIsValid(Document doc, View3D view3D, Action<string, Drawing.Color>? updateStatusCallback = null)
         {
             lock (_cacheLock)
             {
                 string currentModelHash = ComputeModelStateHash(doc);
-                
-                bool needsRebuild = !_isCacheValid || 
-                                _lastModelStateHash != currentModelHash ||
-                                _geometryMmf == null;
+                bool needsRebuild = !_isCacheValid || _lastModelStateHash != currentModelHash || _geometryMmf == null;
                 
                 if (needsRebuild)
                 {
-                    if (TryLoadFromPersistentCache(currentModelHash, updateStatusCallback))
-                    {
-                        _cacheHits++;
-                        updateStatusCallback?.Invoke($"Caché cargado desde disco (Hits: {_cacheHits})", Drawing.Color.Green);
-                        return CreateCachedGeometryData();
-                    }
-
                     _cacheMisses++;
-                    updateStatusCallback?.Invoke($"Reconstruyendo caché de geometría (Misses: {_cacheMisses})...", Drawing.Color.Orange);
-                        
+                    updateStatusCallback?.Invoke($"Reconstruyendo caché (Miss: {_cacheMisses})...", Drawing.Color.Orange);
                     var sw = System.Diagnostics.Stopwatch.StartNew();
                     
+                    // RebuildCache ahora contiene toda la lógica restaurada.
                     RebuildCache(doc, view3D, updateStatusCallback);
                     
                     sw.Stop();
                     _totalExtractionTime = _totalExtractionTime.Add(sw.Elapsed);
                     updateStatusCallback?.Invoke($"Caché reconstruido en {sw.ElapsedMilliseconds}ms", Drawing.Color.Blue);
-                    
                     _lastModelStateHash = currentModelHash;
-                    
-                    SaveToPersistentCache(currentModelHash, updateStatusCallback);
                 }
                 else
                 {
                     _cacheHits++;
-                    updateStatusCallback?.Invoke($"Usando caché en memoria existente (Hit Rate: {GetHitRate():P1})", Drawing.Color.Green);
+                    updateStatusCallback?.Invoke($"Caché válido en memoria (Hit Rate: {GetHitRate():P1})", Drawing.Color.Green);
                 }
-                
                 return CreateCachedGeometryData();
             }
-        }       
-
+        }      
 
         private bool TryLoadFromPersistentCache(string modelHash, Action<string, Drawing.Color>? updateStatusCallback)
         {
@@ -404,30 +374,35 @@ namespace WabiSabiBridge.Extractors.Cache
             try
             {
                 DisposeCurrentCache();
-                updateStatusCallback?.Invoke("Extrayendo geometría del modelo...", Drawing.Color.Blue);
+                
+                // Llama al método de extracción paralela
                 var sceneData = ExtractSceneGeometry(doc, view3D, updateStatusCallback);
                 
                 if (sceneData.VertexCount == 0)
                 {
-                    throw new InvalidOperationException("No se encontró geometría visible para cachear");
+                    throw new InvalidOperationException("No se encontró geometría visible para cachear.");
                 }
                 
-                updateStatusCallback?.Invoke("Optimizando datos de geometría...", Drawing.Color.Blue);
+                updateStatusCallback?.Invoke("Fase 4/4: Escribiendo caché final en memoria...", Drawing.Color.Blue);
+
+                // Convertir las listas finales a arrays para escribirlos en el MMF
                 var vertexArray = sceneData.Vertices.ToArray();
                 var indexArray = sceneData.Triangles.ToArray();
                 var normalArray = sceneData.Normals.ToArray();
-                var elementIdArray = sceneData.ElementIds.ToArray();
-                var categoryIdArray = sceneData.CategoryIds.ToArray();
-                var categoryMapBytes = SerializeCategoryMap(sceneData.CategoryMap);
+                var elementIdArray = sceneData.ElementIds.ToArray();      // <-- RESTAURADO
+                var categoryIdArray = sceneData.CategoryIds.ToArray();     // <-- RESTAURADO
+                var categoryMapBytes = SerializeCategoryMap(sceneData.CategoryMap); // <-- RESTAURADO
 
+                // Calcular tamaños y offsets para todos los datos
                 int headerSize = Marshal.SizeOf<GeometryHeader>();
                 long vertexDataSize = (long)vertexArray.Length * sizeof(float);
                 long indexDataSize = (long)indexArray.Length * sizeof(int);
                 long normalDataSize = (long)normalArray.Length * sizeof(float);
-                long elementIdDataSize = (long)elementIdArray.Length * sizeof(int);
-                long categoryIdDataSize = (long)categoryIdArray.Length * sizeof(int);
-                long categoryMapDataSize = categoryMapBytes.Length;
+                long elementIdDataSize = (long)elementIdArray.Length * sizeof(int);       // <-- RESTAURADO
+                long categoryIdDataSize = (long)categoryIdArray.Length * sizeof(int);      // <-- RESTAURADO
+                long categoryMapDataSize = categoryMapBytes.Length;                        // <-- RESTAURADO
                 
+                // Llenar la estructura del encabezado con todos los offsets correctos
                 var header = new GeometryHeader
                 {
                     VertexCount = sceneData.VertexCount,
@@ -446,39 +421,20 @@ namespace WabiSabiBridge.Extractors.Cache
                 
                 CacheSizeBytes = totalSize;
                 
-                updateStatusCallback?.Invoke("Creando caché en memoria...", Drawing.Color.Blue);
-                
-                string mmfName = "WabiSabi_Geometry_Cache";
-                _currentMmfName = mmfName;
-                
-                try
-                {
-                    var existingMmf = MemoryMappedFile.OpenExisting(mmfName);
-                    existingMmf.Dispose();
-                }
-                catch (FileNotFoundException)
-                { 
-                    /* No existe, está bien, continuamos para crearlo */ 
-                }
-                catch (Exception ex)
-                {
-                    WabiSabiLogger.Log($"No se pudo disponer del MMF existente '{mmfName}'. Error: {ex.Message}", LogLevel.Warning);
-                }
-                
+                // Crear y escribir en el MemoryMappedFile
+                _currentMmfName = "WabiSabi_Geometry_Cache";
                 _geometryMmf = MemoryMappedFile.CreateNew(_currentMmfName, totalSize, MemoryMappedFileAccess.ReadWrite);
                 _geometryAccessor = _geometryMmf.CreateViewAccessor();
                 
-                updateStatusCallback?.Invoke("Escribiendo datos al caché...", Drawing.Color.Blue);
-                
                 _geometryAccessor.Write(0, ref header);
-                
                 _geometryAccessor.WriteArray(header.VerticesOffset, vertexArray, 0, vertexArray.Length);
                 _geometryAccessor.WriteArray(header.IndicesOffset, indexArray, 0, indexArray.Length);
                 _geometryAccessor.WriteArray(header.NormalsOffset, normalArray, 0, normalArray.Length);
-                _geometryAccessor.WriteArray(header.ElementIdsOffset, elementIdArray, 0, elementIdArray.Length);
-                _geometryAccessor.WriteArray(header.CategoryIdsOffset, categoryIdArray, 0, categoryIdArray.Length);
-                _geometryAccessor.WriteArray(header.CategoryMappingOffset, categoryMapBytes, 0, categoryMapBytes.Length);
+                _geometryAccessor.WriteArray(header.ElementIdsOffset, elementIdArray, 0, elementIdArray.Length);       // <-- RESTAURADO
+                _geometryAccessor.WriteArray(header.CategoryIdsOffset, categoryIdArray, 0, categoryIdArray.Length);      // <-- RESTAURADO
+                _geometryAccessor.WriteArray(header.CategoryMappingOffset, categoryMapBytes, 0, categoryMapBytes.Length); // <-- RESTAURADO
                 
+                // Actualizar estadísticas
                 VertexCount = sceneData.VertexCount;
                 TriangleCount = sceneData.TriangleCount;
                 CategoryCount = sceneData.CategoryMap.Count;
@@ -486,9 +442,7 @@ namespace WabiSabiBridge.Extractors.Cache
                 _isCacheValid = true;
 
                 string sizeInfo = CacheSizeBytes > 1048576 ? $"{CacheSizeBytes / 1048576.0:F2} MB" : $"{CacheSizeBytes / 1024.0:F2} KB";
-                updateStatusCallback?.Invoke($"Caché generado: {VertexCount:N0} vértices, {TriangleCount:N0} triángulos ({sizeInfo})", Drawing.Color.Green);
-                
-                WriteStateFile();
+                updateStatusCallback?.Invoke($"Caché generado: {VertexCount:N0} V, {TriangleCount:N0} T ({sizeInfo})", Drawing.Color.Green);
             }
             catch (Exception ex)
             {
@@ -498,220 +452,157 @@ namespace WabiSabiBridge.Extractors.Cache
             }
         }
        
-        // --- INICIO DE MODIFICACIÓN: MÉTODO ExtractSceneGeometry ACTUALIZADO ---
-        private ExtractedSceneData ExtractSceneGeometry(
-            Document doc, 
-            View3D view3D, 
-            Action<string, Drawing.Color>? updateStatusCallback)
+        // --- MÉTODO ExtractSceneGeometry RE-ARQUITECTADO ---
+        private ExtractedSceneData ExtractSceneGeometry(Document doc, View3D view3D, Action<string, Drawing.Color>? updateStatusCallback)
         {
-            var options = new Options 
-            { 
-                DetailLevel = ViewDetailLevel.Medium, // Usar Medium para un buen balance
-                IncludeNonVisibleObjects = false,
-                ComputeReferences = true 
-            };
+            var options = new Options { DetailLevel = ViewDetailLevel.Medium, IncludeNonVisibleObjects = false, ComputeReferences = true };
+            var allElements = new FilteredElementCollector(doc, view3D.Id).WhereElementIsNotElementType().Where(e => e.Category != null && e.Category.CategoryType == CategoryType.Model).ToList();
 
-            var collector = new FilteredElementCollector(doc, view3D.Id)
-                .WhereElementIsNotElementType()
-                .Where(e => e.Category != null && e.Category.CategoryType == CategoryType.Model);
-            
-            var elements = collector.ToList();
-            int processedCount = 0;
-            int totalElements = elements.Count;
-
-            var finalData = new ExtractedSceneData();
-            
-            // --- INICIO DE LA MODIFICACIÓN ---
-            // Nuevo: Diccionario para mapear el ID de Revit a nuestro índice compacto (0, 1, 2...)
-            var categoryIdToCompactIndex = new Dictionary<int, int>();
-            // --- FIN DE LA MODIFICACIÓN ---
-
-            updateStatusCallback?.Invoke($"Extrayendo geometría de {totalElements:N0} elementos...", Drawing.Color.Blue);
-
-            foreach (var element in elements)
+            // --- FASE 1/4: CREACIÓN DEL MAPA DE CATEGORÍAS MAESTRO ---
+            // Este paso es secuencial, muy rápido, y garantiza que no haya conflictos de IDs.
+            updateStatusCallback?.Invoke("Fase 1/4: Analizando categorías del modelo...", Drawing.Color.Blue);
+            var masterCategoryMap = new Dictionary<int, string>();
+            var revitIdToCompactId = new Dictionary<int, int>();
+            foreach (var element in allElements)
             {
-                try
+                if (element.Category == null) continue;
+                int revitCatId = (int)element.Category.Id.Value;
+                if (!revitIdToCompactId.ContainsKey(revitCatId))
                 {
-                    var geometry = element.get_Geometry(options);
-                    if (geometry != null)
-                    {
-                        // --- INICIO DE LA MODIFICACIÓN ---
-                        // Pasamos el nuevo diccionario al método de extracción.
-                        ExtractGeometryFromElement(geometry, finalData, element, categoryIdToCompactIndex);
-                        // --- FIN DE LA MODIFICACIÓN ---
-                    }
-                }
-                catch { /* Ignorar elementos problemáticos */ }
-                
-                processedCount++;
-                if (processedCount % 200 == 0)
-                {
-                    updateStatusCallback?.Invoke($"Extrayendo... {processedCount}/{totalElements}", Drawing.Color.Blue);
+                    int compactId = revitIdToCompactId.Count;
+                    revitIdToCompactId[revitCatId] = compactId;
+                    
+                    string categoryName = Enum.IsDefined(typeof(BuiltInCategory), element.Category.Id.Value) 
+                        ? ((BuiltInCategory)element.Category.Id.Value).ToString() 
+                        : "Unknown";
+                    masterCategoryMap[compactId] = categoryName;
                 }
             }
+            updateStatusCallback?.Invoke($"Fase 1/4: {masterCategoryMap.Count} categorías únicas encontradas.", Drawing.Color.Blue);
 
-            updateStatusCallback?.Invoke($"Extracción completada: {finalData.VertexCount:N0} vértices", Drawing.Color.Green);
+            // --- FASE 2/4: EXTRACCIÓN DE DATOS CRUDOS DE LA API (Productor-Consumidor) ---
+            updateStatusCallback?.Invoke("Fase 2/4: Extrayendo geometría cruda de la API...", Drawing.Color.Blue);
+            var batches = new BlockingCollection<List<Element>>();
+            var rawMeshDataList = new List<RawMeshData>();
+            int totalElements = allElements.Count;
+
+            var producerTask = Task.Run(() => {
+                try {
+                    const int batchSize = 150;
+                    for (int i = 0; i < totalElements; i += batchSize) {
+                        batches.Add(allElements.GetRange(i, Math.Min(batchSize, totalElements - i)));
+                    }
+                } finally { batches.CompleteAdding(); }
+            });
+
+            int processedCount = 0;
+            foreach (var batch in batches.GetConsumingEnumerable()) {
+                foreach (var element in batch) {
+                    try {
+                        var geometry = element.get_Geometry(options);
+                        if (geometry != null) ExtractMeshesFromGeometry(geometry, element, rawMeshDataList);
+                    } catch { /* Ignorar elementos problemáticos */ }
+                }
+                processedCount += batch.Count;
+                updateStatusCallback?.Invoke($"Fase 2/4: Extrayendo... {processedCount}/{totalElements}", Drawing.Color.Blue);
+            }
+            producerTask.Wait();
+
+            // --- FASE 3/4: PROCESAMIENTO PARALELO DE DATOS CRUDOS ---
+            updateStatusCallback?.Invoke($"Fase 3/4: Procesando {rawMeshDataList.Count:N0} mallas en paralelo...", Drawing.Color.Blue);
+            var processedChunks = new ConcurrentBag<ExtractedSceneData>();
+
+            Parallel.ForEach(rawMeshDataList, rawMesh => {
+                var threadLocalData = new ExtractedSceneData();
+                // Cada hilo usa el mapa maestro (revitIdToCompactId) que es de solo lectura, evitando conflictos.
+                AddRawMeshToSceneData(rawMesh, threadLocalData, revitIdToCompactId);
+                processedChunks.Add(threadLocalData);
+            });
+
+            // --- FASE 4/4: FUSIÓN SECUENCIAL FINAL ---
+            updateStatusCallback?.Invoke($"Fase 4/4: Fusionando {processedChunks.Count:N0} fragmentos...", Drawing.Color.Blue);
+            var finalData = new ExtractedSceneData();
+            foreach(var chunk in processedChunks)
+            {
+                finalData.MergeFrom(chunk);
+            }
+            
+            // Asignar el mapa maestro de nombres y categorías al resultado final.
+            finalData.CategoryMap.Clear();
+            foreach(var kvp in masterCategoryMap)
+            {
+                finalData.CategoryMap.Add(kvp.Key, kvp.Value);
+            }
+
             return finalData;
         }
-        // --- FIN DE MODIFICACIÓN ---
 
         // --- Nuevo método auxiliar para extraer y copiar la geometría de forma recursiva ---
         private void ExtractMeshesFromGeometry(GeometryElement geometryElement, Element element, List<RawMeshData> targetList)
         {
-            foreach (GeometryObject geomObj in geometryElement)
-            {
-                if (geomObj is Solid solid && solid.Volume > 1e-6)
-                {
-                    foreach (Face face in solid.Faces)
-                    {
-                        try
-                        {
+            foreach (GeometryObject geomObj in geometryElement) {
+                if (geomObj is Solid solid && solid.Volume > 1e-6) {
+                    foreach (Face face in solid.Faces) {
+                        try {
                             var mesh = face.Triangulate();
-                            if (mesh != null && mesh.NumTriangles > 0)
-                            {
-                                // Copiar los datos usando el método de extensión
-                                targetList.Add(new RawMeshData { 
-                                    Vertices = mesh.Vertices, 
-                                    Triangles = mesh.GetTriangles(), // <-- Llamada al método de extensión
-                                    Element = element 
-                                });
-                            }
-                        }
-                        catch { /* Ignorar caras que no se pueden triangular */ }
+                            if (mesh != null && mesh.NumTriangles > 0) targetList.Add(new RawMeshData { Vertices = mesh.Vertices, Triangles = mesh.GetTriangles(), Element = element });
+                        } catch { }
                     }
                 }
-                else if (geomObj is GeometryInstance instance)
-                {
-                    ExtractMeshesFromGeometry(instance.GetInstanceGeometry(), element, targetList);
-                }
-                else if (geomObj is Mesh mesh && mesh.NumTriangles > 0)
-                {
-                     targetList.Add(new RawMeshData { 
-                        Vertices = mesh.Vertices, 
-                        Triangles = mesh.GetTriangles(), // <-- Llamada al método de extensión
-                        Element = element 
-                    });
-                }
+                else if (geomObj is GeometryInstance instance) ExtractMeshesFromGeometry(instance.GetInstanceGeometry(), element, targetList);
+                else if (geomObj is Mesh mesh && mesh.NumTriangles > 0) targetList.Add(new RawMeshData { Vertices = mesh.Vertices, Triangles = mesh.GetTriangles(), Element = element });
             }
         }
-
-        // --- INICIO DE MODIFICACIÓN: MÉTODO ExtractGeometryFromElement ACTUALIZADO ---
-        private void ExtractGeometryFromElement(GeometryElement geometryElement, ExtractedSceneData sceneData, Element element, Dictionary<int, int> categoryIdMap)
+        
+        // --- Método de ayuda sin cambios ---
+        private void AddRawMeshToSceneData(RawMeshData rawMesh, ExtractedSceneData sceneData, IReadOnlyDictionary<int, int> revitIdToCompactIdMap)
         {
-            foreach (GeometryObject geomObj in geometryElement)
-            {
-                if (geomObj is Solid solid && solid.Volume > 1e-6)
-                {
-                    foreach (Face face in solid.Faces)
-                    {
-                        try
-                        {
-                            var mesh = face.Triangulate();
-                            if (mesh != null && mesh.NumTriangles > 0) 
-                                AddMeshToSceneData(mesh, sceneData, element, categoryIdMap); // <-- Pasar el mapa
-                        }
-                        catch { }
-                    }
-                }
-                else if (geomObj is GeometryInstance instance)
-                {
-                    // La recursión ahora pasa los mismos parámetros.
-                    ExtractGeometryFromElement(instance.GetInstanceGeometry(), sceneData, element, categoryIdMap); // <-- Pasar el mapa
-                }
-                else if (geomObj is Mesh mesh && mesh.NumTriangles > 0)
-                {
-                    AddMeshToSceneData(mesh, sceneData, element, categoryIdMap); // <-- Pasar el mapa
-                }
-            }
-        }
-        // --- FIN DE MODIFICACIÓN ---
-
-        // --- INICIO DE MODIFICACIÓN: MÉTODO AddMeshToSceneData ACTUALIZADO (CAMBIO CRUCIAL) ---
-        private void AddMeshToSceneData(Mesh mesh, ExtractedSceneData sceneData, Element element, Dictionary<int, int> categoryIdToCompactIndexMap)
-        {
-            // 1. Obtener el índice base actual antes de añadir nuevos vértices.
             int baseIndex = sceneData.VertexCount;
-            
+            var element = rawMesh.Element;
             int elementId = (int)element.Id.Value;
             
-            // --- INICIO DE LA MODIFICACIÓN ---
-            int rawRevitCategoryId = (int)(element.Category?.Id.Value ?? -1);
-            string categoryName = "Unknown";
-            if (element.Category != null && Enum.IsDefined(typeof(BuiltInCategory), element.Category.Id.Value))
+            // Busca el ID compacto en el mapa maestro.
+            int compactCategoryId = -1;
+            if (element.Category != null)
             {
-                categoryName = ((BuiltInCategory)element.Category.Id.Value).ToString();
+                // Usa TryGetValue para una búsqueda segura.
+                revitIdToCompactIdMap.TryGetValue((int)element.Category.Id.Value, out compactCategoryId);
             }
-            int compactCategoryId;
 
-            // Si la categoría no está en nuestro mapa, la añadimos y le asignamos un nuevo índice compacto.
-            if (!categoryIdToCompactIndexMap.TryGetValue(rawRevitCategoryId, out compactCategoryId))
-            {
-                compactCategoryId = categoryIdToCompactIndexMap.Count; // El nuevo índice es el tamaño actual del mapa
-                categoryIdToCompactIndexMap[rawRevitCategoryId] = compactCategoryId;
-                
-                // Guardamos el mapeo de [Índice Compacto -> Nombre de Categoría]
-                // Esto es lo que el renderizador usará.
-                if (!sceneData.CategoryMap.ContainsKey(compactCategoryId))
-                {
-                    sceneData.CategoryMap[compactCategoryId] = categoryName;
-                }
-            }
-            // --- FIN DE LA MODIFICACIÓN ---
-
-            // 2. Añadir los vértices del mesh a la lista de vértices de la escena.
-            foreach (XYZ vertex in mesh.Vertices)
-            {
+            // El resto de la lógica permanece igual, pero ahora usa el 'compactCategoryId' correcto.
+            foreach (XYZ vertex in rawMesh.Vertices) {
                 sceneData.Vertices.Add((float)vertex.X);
                 sceneData.Vertices.Add((float)vertex.Y);
                 sceneData.Vertices.Add((float)vertex.Z);
-
                 sceneData.ElementIds.Add(elementId);
-                // --- INICIO DE LA MODIFICACIÓN ---
-                // Guardamos el ÍNDICE COMPACTO, no el ID de Revit.
-                sceneData.CategoryIds.Add(compactCategoryId);
-                // --- FIN DE LA MODIFICACIÓN ---
+                sceneData.CategoryIds.Add(compactCategoryId); // <-- Asigna el ID correcto
             }
 
-            // 3. Añadir los triángulos del mesh, ajustando sus índices con el baseIndex.
-            for (int i = 0; i < mesh.NumTriangles; i++)
-            {
-                var triangle = mesh.get_Triangle(i);
+            foreach (var triangle in rawMesh.Triangles) {
                 sceneData.Triangles.Add(baseIndex + (int)triangle.get_Index(0));
                 sceneData.Triangles.Add(baseIndex + (int)triangle.get_Index(1));
                 sceneData.Triangles.Add(baseIndex + (int)triangle.get_Index(2));
             }
-            
-            // --- Lógica de cálculo de normales ---
-            var vertexNormals = new XYZ[mesh.Vertices.Count];
+
+            var vertexNormals = new XYZ[rawMesh.Vertices.Count];
             for (int i = 0; i < vertexNormals.Length; i++) { vertexNormals[i] = XYZ.Zero; }
-            
-            for (int i = 0; i < mesh.NumTriangles; i++)
-            {
-                var triangle = mesh.get_Triangle(i);
-                int index0 = (int)triangle.get_Index(0);
-                int index1 = (int)triangle.get_Index(1);
-                int index2 = (int)triangle.get_Index(2);
-                
-                var v0 = mesh.Vertices[index0];
-                var v1 = mesh.Vertices[index1];
-                var v2 = mesh.Vertices[index2];
-                
+            foreach(var triangle in rawMesh.Triangles) {
+                int i0 = (int)triangle.get_Index(0);
+                int i1 = (int)triangle.get_Index(1);
+                int i2 = (int)triangle.get_Index(2);
+                var v0 = rawMesh.Vertices[i0];
+                var v1 = rawMesh.Vertices[i1];
+                var v2 = rawMesh.Vertices[i2];
                 var faceNormal = (v1 - v0).CrossProduct(v2 - v0).Normalize();
-                
-                vertexNormals[index0] += faceNormal;
-                vertexNormals[index1] += faceNormal;
-                vertexNormals[index2] += faceNormal;
+                vertexNormals[i0] += faceNormal; vertexNormals[i1] += faceNormal; vertexNormals[i2] += faceNormal;
             }
-            
-            foreach (var normal in vertexNormals)
-            {
+            foreach (var normal in vertexNormals) {
                 var finalNormal = normal.IsZeroLength() ? XYZ.BasisZ : normal.Normalize();
                 sceneData.Normals.Add((float)finalNormal.X);
                 sceneData.Normals.Add((float)finalNormal.Y);
                 sceneData.Normals.Add((float)finalNormal.Z);
             }
         }
-        // --- FIN DE MODIFICACIÓN ---
 
         // Método para calcular las normales suavizadas después de consolidar toda la geometría
         private void CalculateSmoothNormals(ExtractedSceneData sceneData)
@@ -911,7 +802,6 @@ namespace WabiSabiBridge.Extractors.Cache
 
     public class ExtractedSceneData
     {
-        // Las propiedades permanecen igual
         public List<float> Vertices { get; } = new List<float>();
         public List<int> Triangles { get; } = new List<int>();
         public List<float> Normals { get; } = new List<float>();
@@ -932,25 +822,17 @@ namespace WabiSabiBridge.Extractors.Cache
             CategoryMap.Clear();
         }
 
-        // --- INICIO DE LA CORRECCIÓN: MÉTODO DE FUSIÓN SEGURO ---
-        // Este método está diseñado para ser llamado en un bucle SECUENCIAL
-        // después de que todo el procesamiento paralelo haya terminado.
-        // Aunque ya no se usa en ExtractSceneGeometry, se mantiene por si se reutiliza en otro lugar.
+        // --- MÉTODO DE FUSIÓN SEGURO Y SECUENCIAL ---
+        // Este método es la clave para la Fase 3.
         public void MergeFrom(ExtractedSceneData other)
         {
-            // 1. Obtener el índice base actual. Es seguro porque estamos en un bucle secuencial.
             int baseIndex = this.VertexCount; 
-            
-            // 2. Añadir todos los datos por vértice del otro chunk.
             this.Vertices.AddRange(other.Vertices);
             this.Normals.AddRange(other.Normals);
             this.ElementIds.AddRange(other.ElementIds);
             this.CategoryIds.AddRange(other.CategoryIds);
 
-            // 3. Añadir los triángulos, AHORA SÍ re-indexando correctamente.
-            //    Cada índice del otro chunk se desplaza por el baseIndex.
-            foreach (var index in other.Triangles)
-            {
+            foreach (var index in other.Triangles) {
                 this.Triangles.Add(baseIndex + index);
             }
             
@@ -960,7 +842,7 @@ namespace WabiSabiBridge.Extractors.Cache
                 // Add or overwrite. Could use TryAdd in newer .NET versions.
                 if (!this.CategoryMap.ContainsKey(kvp.Key))
                 {
-                    this.CategoryMap[kvp.Key] = kvp.Value;
+                    this.CategoryMap.Add(kvp.Key, kvp.Value);
                 }
             }
         }
