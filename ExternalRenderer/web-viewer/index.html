@@ -1,0 +1,226 @@
+<!-- ExternalRenderer/web-viewer/index.html -->
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WabiSabi Bridge - Viewer</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            font-family: Arial, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+        }
+        
+        #container {
+            width: 100vw;
+            height: 100vh;
+            position: relative;
+        }
+        
+        #controls {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            border-radius: 8px;
+            border: 1px solid #333;
+        }
+        
+        .control-group {
+            margin-bottom: 15px;
+        }
+        
+        .control-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-size: 14px;
+            color: #aaa;
+        }
+        
+        .control-buttons {
+            display: flex;
+            gap: 10px;
+        }
+        
+        .control-button {
+            padding: 8px 16px;
+            background: #333;
+            border: 1px solid #555;
+            color: #fff;
+            cursor: pointer;
+            border-radius: 4px;
+            transition: all 0.3s;
+        }
+        
+        .control-button:hover {
+            background: #444;
+            border-color: #666;
+        }
+        
+        .control-button.active {
+            background: #0066cc;
+            border-color: #0088ff;
+        }
+        
+        #info {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            background: rgba(0,0,0,0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #333;
+            font-size: 12px;
+        }
+        
+        #connection-status {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: rgba(0,0,0,0.8);
+            padding: 10px 20px;
+            border-radius: 20px;
+            border: 1px solid #333;
+        }
+        
+        .status-indicator {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: #ff4444;
+        }
+        
+        .status-indicator.connected {
+            background: #44ff44;
+        }
+        
+        .status-indicator.connecting {
+            background: #ffaa44;
+            animation: pulse 1s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        #fps-counter {
+            position: absolute;
+            top: 80px;
+            right: 20px;
+            background: rgba(0,0,0,0.8);
+            padding: 10px;
+            border-radius: 4px;
+            border: 1px solid #333;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="controls">
+            <h3 style="margin-top: 0;">WabiSabi Viewer</h3>
+            
+            <div class="control-group">
+                <label>Modo de Visualización:</label>
+                <div class="control-buttons">
+                    <button class="control-button active" data-mode="0">Depth</button>
+                    <button class="control-button" data-mode="1">Normal</button>
+                    <button class="control-button" data-mode="2">Lines</button>
+                    <button class="control-button" data-mode="3">Segmentation</button>
+                </div>
+            </div>
+            
+            <div class="control-group">
+                <label>Vista:</label>
+                <div class="control-buttons">
+                    <button class="control-button active" data-view="single">Individual</button>
+                    <button class="control-button" data-view="grid">Grilla 2x2</button>
+                </div>
+            </div>
+            
+            <div class="control-group">
+                <label>Opciones:</label>
+                <div style="margin-top: 10px;">
+                    <label style="display: inline-block;">
+                        <input type="checkbox" id="autoUpdate" checked> Auto-actualizar
+                    </label>
+                </div>
+            </div>
+        </div>
+        
+        <div id="connection-status">
+            <span class="status-indicator" id="status-indicator"></span>
+            <span id="status-text">Desconectado</span>
+        </div>
+        
+        <div id="fps-counter">
+            <div>FPS: <span id="fps">0</span></div>
+            <div>Latencia: <span id="latency">--</span>ms</div>
+        </div>
+        
+        <div id="info">
+            <div>Resolución: <span id="resolution">--</span></div>
+            <div>Última actualización: <span id="lastUpdate">--</span></div>
+        </div>
+    </div>
+    
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="WabiSabiViewer.js"></script>
+    <script>
+        // Inicializar viewer
+        const viewer = new WabiSabiViewer('container');
+        
+        // Event listeners para controles
+        document.querySelectorAll('[data-mode]').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                document.querySelectorAll('[data-mode]').forEach(b => b.classList.remove('active'));
+                e.target.classList.add('active');
+                viewer.setDisplayMode(parseInt(e.target.dataset.mode));
+            });
+        });
+        
+        document.querySelectorAll('[data-view]').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                document.querySelectorAll('[data-view]').forEach(b => b.classList.remove('active'));
+                e.target.classList.add('active');
+                viewer.setViewMode(e.target.dataset.view);
+            });
+        });
+        
+        document.getElementById('autoUpdate').addEventListener('change', (e) => {
+            viewer.setAutoUpdate(e.target.checked);
+        });
+        
+        // Atajos de teclado
+        document.addEventListener('keydown', (e) => {
+            switch(e.key) {
+                case '1':
+                case '2':
+                case '3':
+                case '4':
+                    const mode = parseInt(e.key) - 1;
+                    viewer.setDisplayMode(mode);
+                    document.querySelectorAll('[data-mode]').forEach(b => b.classList.remove('active'));
+                    document.querySelector(`[data-mode="${mode}"]`).classList.add('active');
+                    break;
+                case 'g':
+                    viewer.toggleViewMode();
+                    break;
+                case 'p':
+                    viewer.toggleAutoUpdate();
+                    break;
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,11 @@
+# category_colors.csv
+Category,Color
+Walls,#FFFFFF
+Floors,#808080
+Ceilings,#C8C8C8
+Windows,#64C8FF
+Doors,#966432
+Furniture,#FFC864
+Structural Columns,#C86464
+Stairs,#A0A0A0
+Generic Models,#FF64FF

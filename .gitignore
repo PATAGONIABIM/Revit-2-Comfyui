@@ -1,14 +1,14 @@
 # Archivo .gitignore para un proyecto de C#/.NET en Visual Studio
 
 ## Carpetas de salida de compilación
-# Contienen los binarios compilados y archivos intermedios. [1, 2] 
+# Contienen los binarios compilados y archivos intermedios.
 # Se generan cada vez que compilas el proyecto.
 [Bb]in/
 [Oo]bj/
 
 ## Archivos y carpetas específicos de Visual Studio
-# La carpeta .vs almacena información específica del usuario y de la sesión, 
-# como los archivos que tienes abiertos, puntos de interrupción, etc. [14, 22, 23]
+# La carpeta .vs almacena información específica del usuario y de la sesión,
+# como los archivos que tienes abiertos, puntos de interrupción, etc.
 .vs/
 
 # Archivos de opciones de usuario de Visual Studio. Contienen configuraciones locales
@@ -20,6 +20,8 @@
 # Carpetas de documentación y configuración del proyecto que no deseas versionar.
 
 properties/
+node_modules/
+build/
 
 ## Archivos de paquetes NuGet
 # Los paquetes se deben restaurar, no almacenar en el repositorio.

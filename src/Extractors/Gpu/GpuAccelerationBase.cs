@@ -290,6 +290,24 @@ namespace WabiSabiBridge.Extractors.Gpu
 
     public class GpuAccelerationManager : IGpuAccelerationManager, IDisposable
     {
+        // --- INICIO DE LA CORRECCIÓN ---
+        // Define la misma estructura de encabezado que tienes en GeometryCacheManager.cs
+        // para poder leerla desde el archivo.
+        [StructLayout(LayoutKind.Sequential, Pack = 1)]
+        private struct GeometryHeader
+        {
+            public int VertexCount;
+            public int TriangleCount;
+            public int CategoryCount;
+            public long VerticesOffset;
+            public long IndicesOffset;
+            public long NormalsOffset;
+            public long ElementIdsOffset;
+            public long CategoryIdsOffset;
+            public long CategoryMappingOffset;
+        }
+        // --- FIN DE LA CORRECCIÓN ---
+        
         private GraphicsDevice? _device;
         private MemoryMappedFile? _geometryMmf;
         private MemoryMappedViewAccessor? _geometryAccessor;
@@ -464,34 +482,42 @@ namespace WabiSabiBridge.Extractors.Gpu
         }
         
         /// <summary>
-        /// NUEVO: Helper para cargar geometría y devolver buffers GPU desechables.
+        /// CORREGIDO: Helper para cargar geometría usando el encabezado del archivo de caché.
         /// </summary>
-        private (ReadOnlyBuffer<Float3> vertexBuffer, ReadOnlyBuffer<Int3> triangleBuffer, ReadOnlyBuffer<Float3> normalBuffer) LoadGeometryFromCache(MemoryMappedFile cacheFile, int vertexCount, int triangleCount)
+        private (ReadOnlyBuffer<Float3> vertexBuffer, ReadOnlyBuffer<Int3> triangleBuffer, ReadOnlyBuffer<Float3> normalBuffer) LoadGeometryFromCache(MemoryMappedFile cacheFile, int expectedVertexCount, int expectedTriangleCount)
         {
-            int vertexFloatCount = vertexCount * 3;
-            int triangleIntCount = triangleCount * 3;
-
-            float[] vertices = _floatPool.Rent(vertexFloatCount);
-            int[] triangleIndices = _intPool.Rent(triangleIntCount);
-            float[] normals = _floatPool.Rent(vertexFloatCount); // Asumimos que siempre hay normales por simplicidad
+            // Arrays temporales para leer los datos del disco
+            float[] vertices = _floatPool.Rent(expectedVertexCount * 3);
+            int[] triangleIndices = _intPool.Rent(expectedTriangleCount * 3);
+            float[] normals = _floatPool.Rent(expectedVertexCount * 3);
 
             try
             {
                 using (var accessor = cacheFile.CreateViewAccessor())
                 {
-                    long offset = 0;
-                    accessor.ReadArray(offset, vertices, 0, vertexFloatCount);
-                    offset += (long)vertexFloatCount * sizeof(float);
-                    accessor.ReadArray(offset, triangleIndices, 0, triangleIntCount);
-                    offset += (long)triangleIntCount * sizeof(int);
-                    accessor.ReadArray(offset, normals, 0, vertexFloatCount);
+                    // 1. Leer el encabezado desde el principio del archivo (offset 0)
+                    accessor.Read(0, out GeometryHeader header);
+
+                    // (Opcional) Validación para asegurar que el caché es consistente
+                    if (header.VertexCount != expectedVertexCount || header.TriangleCount != expectedTriangleCount)
+                    {
+                        throw new InvalidOperationException("Inconsistencia en los metadatos del caché.");
+                    }
+
+                    // 2. Usar los offsets del encabezado para leer los datos correctamente
+                    accessor.ReadArray(header.VerticesOffset, vertices, 0, vertices.Length);
+                    accessor.ReadArray(header.IndicesOffset, triangleIndices, 0, triangleIndices.Length);
+                    accessor.ReadArray(header.NormalsOffset, normals, 0, normals.Length);
                 }
 
-                Float3[] gpuVertices = ConvertToFloat3Array(vertices, vertexCount);
-                Int3[] gpuTriangles = new Int3[triangleCount];
-                for (int i = 0; i < triangleCount; i++)
+                // 3. Convertir los arrays de C# a búferes de GPU (esta parte ya era correcta)
+                Float3[] gpuVertices = ConvertToFloat3Array(vertices, expectedVertexCount);
+                Int3[] gpuTriangles = new Int3[expectedTriangleCount];
+                for (int i = 0; i < expectedTriangleCount; i++)
+                {
                     gpuTriangles[i] = new Int3(triangleIndices[i * 3], triangleIndices[i * 3 + 1], triangleIndices[i * 3 + 2]);
-                Float3[] gpuNormals = ConvertToFloat3Array(normals, vertexCount);
+                }
+                Float3[] gpuNormals = ConvertToFloat3Array(normals, expectedVertexCount);
                 
                 var vertexBuffer = _device!.AllocateReadOnlyBuffer(gpuVertices);
                 var triangleBuffer = _device!.AllocateReadOnlyBuffer(gpuTriangles);
@@ -501,6 +527,7 @@ namespace WabiSabiBridge.Extractors.Gpu
             }
             finally
             {
+                // Devolver los arrays al pool para reutilización
                 _floatPool.Return(vertices);
                 _intPool.Return(triangleIndices);
                 _floatPool.Return(normals);
@@ -520,8 +547,9 @@ namespace WabiSabiBridge.Extractors.Gpu
                 using (var cacheFile = MemoryMappedFile.OpenExisting(mmfName))
                 using (var accessor = cacheFile.CreateViewAccessor())
                 {
-                    accessor.ReadArray(0, vertices, 0, vertices.Length);
-                    accessor.ReadArray((long)vertices.Length * sizeof(float), triangles, 0, triangles.Length);
+                    accessor.Read(0, out GeometryHeader header);
+                    accessor.ReadArray(header.VerticesOffset, vertices, 0, vertices.Length);
+                    accessor.ReadArray(header.IndicesOffset, triangles, 0, triangles.Length);
                 }
                 var eyePosition = new Vector3(config.EyePosition.X, config.EyePosition.Y, config.EyePosition.Z);
                 var viewDirection = new Vector3(config.ViewDirection.X, config.ViewDirection.Y, config.ViewDirection.Z);

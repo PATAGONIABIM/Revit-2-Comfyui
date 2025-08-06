@@ -1,0 +1,58 @@
+// ======================================================================================
+// ARCHIVO: WabiSabiKernels.cuh - VERSIÓN FINAL-FINAL-CORREGIDA
+// ======================================================================================
+
+#pragma once
+#include <cuda_runtime.h>
+#include <cuda.h>
+
+// Estructura de datos para la GPU
+struct CameraData {
+    float3 eyePosition;
+    float3 lower_left_corner;
+    float3 horizontal_vec;
+    float3 vertical_vec;
+    uint64_t timestamp;
+};
+
+// --------------------------------------------------------------------------------------
+// ESTRUCTURA DE CONFIGURACIÓN CORREGIDA
+// --------------------------------------------------------------------------------------
+struct RenderConfig {
+    int width;
+    int height;
+    float minDepth;
+    float maxDepth;
+    float depthThreshold;  // <-- Nombre corregido para consistencia
+    float normalThreshold; // <-- CAMPO AÑADIDO Y CORREGIDO
+};
+
+
+// --------------------------------------------------------------------------------------
+// DECLARACIONES DE FUNCIONES DE LANZAMIENTO
+// --------------------------------------------------------------------------------------
+
+void LaunchDepthKernel(
+    const float3* d_vertices, int vertexCount, const int* d_triangles, int triangleCount,
+    const CameraData& camera, const RenderConfig& config, float* d_depthMap, cudaStream_t stream
+);
+
+void LaunchNormalKernel(
+    const float3* d_vertices, int vertexCount, const int* d_triangles, const float3* d_normals, int triangleCount,
+    const CameraData& camera, const RenderConfig& config, float3* d_normalMap, cudaStream_t stream
+);
+
+// DECLARACIÓN PARA LÍNEAS (BASADA SOLO EN NORMALES)
+void LaunchLinesKernel(
+    const float3* d_normalMap,
+    const RenderConfig& config,
+    float* d_linesMap,
+    cudaStream_t stream
+);
+
+// DECLARACIÓN PARA SEGMENTACIÓN
+void LaunchSegmentationKernel(
+    const float3* d_vertices, int vertexCount, const int* d_triangles, const int* d_categoryIds,
+    const float3* categoryColors, int triangleCount, int categoryCount,
+    const CameraData& camera, const RenderConfig& config, float4* d_segmentationMap, cudaStream_t stream
+);

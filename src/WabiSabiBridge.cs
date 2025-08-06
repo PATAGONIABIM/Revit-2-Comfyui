@@ -1093,60 +1093,41 @@ namespace WabiSabiBridge
             
             _autoExportCheckBox.CheckedChanged += async (s, e) =>
             {
-                // --- INICIO DE CIRUGÍA 2: CORREGIR LA LLAMADA AL MÉTODO ---
-
-                // Usar el guardia para evitar que el evento se ejecute a sí mismo.
                 if (_isHandlingAutoExportChange) return;
 
                 _isHandlingAutoExportChange = true;
                 try
                 {
-                    // Guardar la configuración del usuario inmediatamente.
                     _config.AutoExport = _autoExportCheckBox.Checked;
                     _config.Save();
 
                     if (_autoExportCheckBox.Checked)
                     {
-                        // El usuario quiere ACTIVAR el servicio.
-                        UpdateStatus("Iniciando auto-export optimizado...", Drawing.Color.Blue);
+                        // Detener el monitor interno de C# para ceder el control.
+                        WabiSabiBridgeApp.AutoExportManager?.StopAutoExport();
+                        UpdateStatus("Monitor C# detenido. Cedido el control al renderizador externo.", Drawing.Color.Orange);
 
-                        var doc = _uiApp.ActiveUIDocument.Document;
-                        var view3D = doc.ActiveView as View3D;
-
-                        if (view3D != null && WabiSabiBridgeApp.AutoExportManager != null)
-                        {
-                            // Llamada corregida: Pasamos _uiApp en lugar de uiView.
-                            await WabiSabiBridgeApp.AutoExportManager.StartAutoExport(_uiApp, doc, view3D);
-                            UpdateStatus("Auto-export activo (Modo Caché/GPU)", Drawing.Color.Green);
-                        }
-                        else
-                        {
-                            throw new InvalidOperationException("Se requiere una vista 3D activa para iniciar el auto-export.");
-                        }
+                        // Aquí es donde lanzarías el renderizador externo si es necesario.
+                        // Por ejemplo: System.Diagnostics.Process.Start("path/to/ExternalRenderer.exe");
+                        
+                        UpdateStatus("Auto-Export (Externo) Habilitado. El renderizador externo tiene el control.", Drawing.Color.Green);
                     }
                     else
                     {
-                        // El usuario quiere DESACTIVAR el servicio.
-                        UpdateStatus("Deteniendo auto-export...", Drawing.Color.Orange);
-                        // Llamar al gestor estático para detener la operación.
+                        // Si se desmarca, asegurarse de que el monitor de C# esté detenido.
                         WabiSabiBridgeApp.AutoExportManager?.StopAutoExport();
-                        UpdateStatus("Auto-export desactivado", Drawing.Color.Orange);
+                        UpdateStatus("Auto-export desactivado.", Drawing.Color.Orange);
                     }
                 }
                 catch (Exception ex)
                 {
-                    // Si cualquier parte del proceso de activación falla...
-                    UpdateStatus($"Error al iniciar auto-export: {ex.Message}", Drawing.Color.Red);
-                    
-                    // ...se asegura que el checkbox refleje el estado real (desactivado).
-                    _autoExportCheckBox.Checked = false;
+                    UpdateStatus($"Error: {ex.Message}", Drawing.Color.Red);
+                    _autoExportCheckBox.Checked = false; // Revertir en caso de error
                 }
                 finally
                 {
-                    // Liberar el guardia para permitir futuros clics del usuario.
                     _isHandlingAutoExportChange = false;
                 }
-                
             };
             
             _autoDepthCheckBox.CheckedChanged += (s, e) => {

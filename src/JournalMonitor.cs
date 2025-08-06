@@ -128,9 +128,11 @@ namespace WabiSabiBridge
 
             var matches = _cameraDirectiveRegex.Matches(contentToProcess);
             
+            // Si no se encuentra ninguna directiva de cámara, podemos limpiar el buffer
+            // si crece demasiado para evitar consumir memoria con "ruido" del journal.
             if (matches.Count == 0)
             {
-                const int MAX_BUFFER_SIZE = 15 * 1024;
+                const int MAX_BUFFER_SIZE = 15 * 1024; // 15 KB
                 if (_contentBuffer.Length > MAX_BUFFER_SIZE)
                 {
                     WabiSabiLogger.LogDiagnostic("JournalMonitor", "Buffer de ruido limpiado para evitar sobrecarga.");
@@ -139,35 +141,49 @@ namespace WabiSabiBridge
                 return;
             }
 
+            // Solo nos interesa la última posición de la cámara para tener la más reciente.
             var lastMatch = matches[matches.Count - 1];
             try
             {
-                // Los valores del journal vienen en orden Y, Z, X
-                // Necesitamos reordenarlos a X, Y, Z
+                // --- INICIO DE LA CORRECCIÓN CRÍTICA ---
+                // El journal guarda las coordenadas en el orden: Y, Z, X
+                // El constructor de Revit XYZ es: new XYZ(X, Y, Z)
+                // Por lo tanto, debemos mapear los grupos de la Regex correctamente.
+                //
+                // Grupos de la Regex para Eye Position:
+                // Group[1] -> Y
+                // Group[2] -> Z
+                // Group[3] -> X
                 
                 var eyePos = new XYZ(
-                    double.Parse(lastMatch.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture), // X = Value[3]
-                    double.Parse(lastMatch.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture), // Y = Value[1]
-                    double.Parse(lastMatch.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture)  // Z = Value[2]
+                    double.Parse(lastMatch.Groups[3].Value, System.Globalization.CultureInfo.InvariantCulture), // Asignar Group[3] (X del journal) a la X de Revit
+                    double.Parse(lastMatch.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture), // Asignar Group[1] (Y del journal) a la Y de Revit
+                    double.Parse(lastMatch.Groups[2].Value, System.Globalization.CultureInfo.InvariantCulture)  // Asignar Group[2] (Z del journal) a la Z de Revit
                 );
                 
+                // Grupos para Target Position:
+                // Group[4] -> Y
+                // Group[5] -> Z
+                // Group[6] -> X
                 var targetPos = new XYZ(
-                    double.Parse(lastMatch.Groups[6].Value, System.Globalization.CultureInfo.InvariantCulture), // X = Value[6]
-                    double.Parse(lastMatch.Groups[4].Value, System.Globalization.CultureInfo.InvariantCulture), // Y = Value[4]
-                    double.Parse(lastMatch.Groups[5].Value, System.Globalization.CultureInfo.InvariantCulture)  // Z = Value[5]
+                    double.Parse(lastMatch.Groups[6].Value, System.Globalization.CultureInfo.InvariantCulture), // X
+                    double.Parse(lastMatch.Groups[4].Value, System.Globalization.CultureInfo.InvariantCulture), // Y
+                    double.Parse(lastMatch.Groups[5].Value, System.Globalization.CultureInfo.InvariantCulture)  // Z
                 );
 
+                // Grupos para Up Direction:
+                // Group[7] -> Y
+                // Group[8] -> Z
+                // Group[9] -> X
                 var upDir = new XYZ(
-                    double.Parse(lastMatch.Groups[9].Value, System.Globalization.CultureInfo.InvariantCulture), // X = Value[9]
-                    double.Parse(lastMatch.Groups[7].Value, System.Globalization.CultureInfo.InvariantCulture), // Y = Value[7]
-                    double.Parse(lastMatch.Groups[8].Value, System.Globalization.CultureInfo.InvariantCulture)  // Z = Value[8]
+                    double.Parse(lastMatch.Groups[9].Value, System.Globalization.CultureInfo.InvariantCulture), // X
+                    double.Parse(lastMatch.Groups[7].Value, System.Globalization.CultureInfo.InvariantCulture), // Y
+                    double.Parse(lastMatch.Groups[8].Value, System.Globalization.CultureInfo.InvariantCulture)  // Z
                 );
 
-                // Logging para verificar
-                WabiSabiLogger.Log($"JournalMonitor - Reordered Eye: ({eyePos.X:F2}, {eyePos.Y:F2}, {eyePos.Z:F2})", LogLevel.Debug);
-                WabiSabiLogger.Log($"JournalMonitor - Reordered Target: ({targetPos.X:F2}, {targetPos.Y:F2}, {targetPos.Z:F2})", LogLevel.Debug);
-                WabiSabiLogger.Log($"JournalMonitor - Reordered Up: ({upDir.X:F2}, {upDir.Y:F2}, {upDir.Z:F2})", LogLevel.Debug);
-                
+                // --- FIN DE LA CORRECCIÓN CRÍTICA ---
+
+                // El resto de la lógica para calcular la dirección y encolar los datos es correcta.
                 var viewDir = (targetPos - eyePos).Normalize();
 
                 var cameraData = new CameraData
@@ -179,15 +195,19 @@ namespace WabiSabiBridge
                     Timestamp = System.Diagnostics.Stopwatch.GetTimestamp()
                 };
 
-                _cameraBuffer.TryWrite(cameraData);
-                WabiSabiLogger.LogDiagnostic("JournalMonitor_Success", $"¡ÉXITO! Datos de cámara extraídos. Seq: {cameraData.SequenceNumber}");
+                if (_cameraBuffer.TryWrite(cameraData))
+                {
+                    WabiSabiLogger.LogDiagnostic("JournalMonitor_Success", $"¡ÉXITO! Datos de cámara extraídos y encolados. Seq: {cameraData.SequenceNumber}");
+                }
 
+                // Limpiamos el buffer hasta el final de lo que acabamos de procesar
+                // para no volver a analizarlo.
                 _contentBuffer.Remove(0, lastMatch.Index + lastMatch.Length);
             }
             catch (Exception ex)
             {
-                WabiSabiLogger.LogError("Journal Monitor: Error al parsear datos de cámara del buffer.", ex);
-                _contentBuffer.Clear();
+                WabiSabiLogger.LogError("Journal Monitor: Error al parsear datos de cámara del buffer. El buffer será limpiado.", ex);
+                _contentBuffer.Clear(); // Limpiar en caso de error para evitar bucles infinitos.
             }
         }
 

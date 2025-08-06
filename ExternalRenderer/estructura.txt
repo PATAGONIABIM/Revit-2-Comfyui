@@ -1,0 +1,37 @@
+WabiSabiBridge/
+├── Revit Plugin (existente)/
+│   ├── WabiSabiBridge.cs
+│   ├── Extractors/
+│   │   └── Cache/
+│   │       └── GeometryCacheManager.cs (MODIFICAR)
+│   └── ...
+│
+└── ExternalRenderer/ (NUEVO)
+    ├── CMakeLists.txt
+    ├── README.md
+    ├── src/
+    │   ├── core/
+    │   │   ├── WabiSabiRenderer.h
+    │   │   ├── WabiSabiRenderer.cpp
+    │   │   ├── MemoryMappedFile.h
+    │   │   └── MemoryMappedFile.cpp
+    │   ├── cuda/
+    │   │   ├── WabiSabiKernels.cu
+    │   │   ├── WabiSabiKernels.cuh
+    │   │   └── CudaHelpers.h
+    │   ├── utils/
+    │   │   ├── CSVReader.h
+    │   │   ├── CSVReader.cpp
+    │   │   ├── JournalParser.h
+    │   │   └── JournalParser.cpp
+    │   └── main.cpp
+    ├── web-viewer/
+    │   ├── index.html
+    │   ├── WabiSabiViewer.js
+    │   ├── package.json
+    │   └── server.js
+    ├── config/
+    │   ├── category_colors.csv
+    │   └── renderer_config.json
+    └── build/
+        └── (archivos generados)
