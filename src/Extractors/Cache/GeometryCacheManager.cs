@@ -498,7 +498,7 @@ namespace WabiSabiBridge.Extractors.Cache
             }
         }
        
-        // --- INICIO DE MODIFICACIÓN: MÉTODO ExtractSceneGeometry SECUENCIAL ---
+        // --- INICIO DE MODIFICACIÓN: MÉTODO ExtractSceneGeometry ACTUALIZADO ---
         private ExtractedSceneData ExtractSceneGeometry(
             Document doc, 
             View3D view3D, 
@@ -519,12 +519,15 @@ namespace WabiSabiBridge.Extractors.Cache
             int processedCount = 0;
             int totalElements = elements.Count;
 
-            // Objeto de datos único que se llenará de forma secuencial.
             var finalData = new ExtractedSceneData();
             
-            updateStatusCallback?.Invoke($"Extrayendo geometría de {totalElements:N0} elementos de forma secuencial...", Drawing.Color.Blue);
+            // --- INICIO DE LA MODIFICACIÓN ---
+            // Nuevo: Diccionario para mapear el ID de Revit a nuestro índice compacto (0, 1, 2...)
+            var categoryIdToCompactIndex = new Dictionary<int, int>();
+            // --- FIN DE LA MODIFICACIÓN ---
 
-            // Bucle foreach secuencial, como en la versión de referencia.
+            updateStatusCallback?.Invoke($"Extrayendo geometría de {totalElements:N0} elementos...", Drawing.Color.Blue);
+
             foreach (var element in elements)
             {
                 try
@@ -532,15 +535,14 @@ namespace WabiSabiBridge.Extractors.Cache
                     var geometry = element.get_Geometry(options);
                     if (geometry != null)
                     {
-                        // Se llama al método auxiliar para que popule directamente el objeto 'finalData'.
-                        // La lógica interna de 'ExtractGeometryFromElement' y 'AddMeshToSceneData'
-                        // ya es compatible con este enfoque.
-                        ExtractGeometryFromElement(geometry, finalData, element);
+                        // --- INICIO DE LA MODIFICACIÓN ---
+                        // Pasamos el nuevo diccionario al método de extracción.
+                        ExtractGeometryFromElement(geometry, finalData, element, categoryIdToCompactIndex);
+                        // --- FIN DE LA MODIFICACIÓN ---
                     }
                 }
                 catch { /* Ignorar elementos problemáticos */ }
                 
-                // Actualizar el progreso
                 processedCount++;
                 if (processedCount % 200 == 0)
                 {
@@ -593,9 +595,8 @@ namespace WabiSabiBridge.Extractors.Cache
             }
         }
 
-        
-
-        private void ExtractGeometryFromElement(GeometryElement geometryElement, ExtractedSceneData sceneData, Element element)
+        // --- INICIO DE MODIFICACIÓN: MÉTODO ExtractGeometryFromElement ACTUALIZADO ---
+        private void ExtractGeometryFromElement(GeometryElement geometryElement, ExtractedSceneData sceneData, Element element, Dictionary<int, int> categoryIdMap)
         {
             foreach (GeometryObject geomObj in geometryElement)
             {
@@ -607,7 +608,7 @@ namespace WabiSabiBridge.Extractors.Cache
                         {
                             var mesh = face.Triangulate();
                             if (mesh != null && mesh.NumTriangles > 0) 
-                                AddMeshToSceneData(mesh, sceneData, element);
+                                AddMeshToSceneData(mesh, sceneData, element, categoryIdMap); // <-- Pasar el mapa
                         }
                         catch { }
                     }
@@ -615,31 +616,47 @@ namespace WabiSabiBridge.Extractors.Cache
                 else if (geomObj is GeometryInstance instance)
                 {
                     // La recursión ahora pasa los mismos parámetros.
-                    ExtractGeometryFromElement(instance.GetInstanceGeometry(), sceneData, element);
+                    ExtractGeometryFromElement(instance.GetInstanceGeometry(), sceneData, element, categoryIdMap); // <-- Pasar el mapa
                 }
                 else if (geomObj is Mesh mesh && mesh.NumTriangles > 0)
                 {
-                    AddMeshToSceneData(mesh, sceneData, element);
+                    AddMeshToSceneData(mesh, sceneData, element, categoryIdMap); // <-- Pasar el mapa
                 }
             }
         }
+        // --- FIN DE MODIFICACIÓN ---
 
-        private void AddMeshToSceneData(Mesh mesh, ExtractedSceneData sceneData, Element element)
+        // --- INICIO DE MODIFICACIÓN: MÉTODO AddMeshToSceneData ACTUALIZADO (CAMBIO CRUCIAL) ---
+        private void AddMeshToSceneData(Mesh mesh, ExtractedSceneData sceneData, Element element, Dictionary<int, int> categoryIdToCompactIndexMap)
         {
             // 1. Obtener el índice base actual antes de añadir nuevos vértices.
-            //    Esto funciona perfectamente en modo secuencial.
             int baseIndex = sceneData.VertexCount;
             
-            // Obtener IDs de forma segura
             int elementId = (int)element.Id.Value;
-            int categoryId = (int)(element.Category?.Id.Value ?? -1);
-            string categoryName = element.Category?.Name ?? "Unknown";
             
-            // Guardar mapeo de categorías.
-            if (!sceneData.CategoryMap.ContainsKey(categoryId))
+            // --- INICIO DE LA MODIFICACIÓN ---
+            int rawRevitCategoryId = (int)(element.Category?.Id.Value ?? -1);
+            string categoryName = "Unknown";
+            if (element.Category != null && Enum.IsDefined(typeof(BuiltInCategory), element.Category.Id.Value))
             {
-                sceneData.CategoryMap[categoryId] = categoryName;
+                categoryName = ((BuiltInCategory)element.Category.Id.Value).ToString();
             }
+            int compactCategoryId;
+
+            // Si la categoría no está en nuestro mapa, la añadimos y le asignamos un nuevo índice compacto.
+            if (!categoryIdToCompactIndexMap.TryGetValue(rawRevitCategoryId, out compactCategoryId))
+            {
+                compactCategoryId = categoryIdToCompactIndexMap.Count; // El nuevo índice es el tamaño actual del mapa
+                categoryIdToCompactIndexMap[rawRevitCategoryId] = compactCategoryId;
+                
+                // Guardamos el mapeo de [Índice Compacto -> Nombre de Categoría]
+                // Esto es lo que el renderizador usará.
+                if (!sceneData.CategoryMap.ContainsKey(compactCategoryId))
+                {
+                    sceneData.CategoryMap[compactCategoryId] = categoryName;
+                }
+            }
+            // --- FIN DE LA MODIFICACIÓN ---
 
             // 2. Añadir los vértices del mesh a la lista de vértices de la escena.
             foreach (XYZ vertex in mesh.Vertices)
@@ -648,9 +665,11 @@ namespace WabiSabiBridge.Extractors.Cache
                 sceneData.Vertices.Add((float)vertex.Y);
                 sceneData.Vertices.Add((float)vertex.Z);
 
-                // Añadir IDs por vértice
                 sceneData.ElementIds.Add(elementId);
-                sceneData.CategoryIds.Add(categoryId);
+                // --- INICIO DE LA MODIFICACIÓN ---
+                // Guardamos el ÍNDICE COMPACTO, no el ID de Revit.
+                sceneData.CategoryIds.Add(compactCategoryId);
+                // --- FIN DE LA MODIFICACIÓN ---
             }
 
             // 3. Añadir los triángulos del mesh, ajustando sus índices con el baseIndex.
@@ -692,6 +711,7 @@ namespace WabiSabiBridge.Extractors.Cache
                 sceneData.Normals.Add((float)finalNormal.Z);
             }
         }
+        // --- FIN DE MODIFICACIÓN ---
 
         // Método para calcular las normales suavizadas después de consolidar toda la geometría
         private void CalculateSmoothNormals(ExtractedSceneData sceneData)
@@ -741,11 +761,12 @@ namespace WabiSabiBridge.Extractors.Cache
             using (var ms = new MemoryStream())
             using (var writer = new BinaryWriter(ms))
             {
+                // El formato es: [count], luego repetidamente [int key, string value]
                 writer.Write(categoryMap.Count);
                 foreach (var kvp in categoryMap)
                 {
-                    writer.Write(kvp.Key);
-                    writer.Write(kvp.Value);
+                    writer.Write(kvp.Key);       // Escribe el índice compacto (ej: 0, 1, 2...)
+                    writer.Write(kvp.Value);     // Escribe el nombre de la categoría (ej: "Walls")
                 }
                 return ms.ToArray();
             }

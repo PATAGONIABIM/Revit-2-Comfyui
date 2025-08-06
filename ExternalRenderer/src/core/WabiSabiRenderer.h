@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cuda_runtime.h>
 #include <vector>
+#include <unordered_map> // <-- ¡SOLUCIÓN! Añadir esta línea
 
 class WabiSabiRenderer {
 public:
@@ -115,4 +116,6 @@ private:
     void StartWebSocketServer();   
     void SendMapsToWebSocket();    
     CameraData GetLatestCamera();
+
+    std::unordered_map<int, std::string> categoryIndexToNameMap;
 };

@@ -1,11 +1,39 @@
-# category_colors.csv
+# WabiSabi Bridge - Color-Category Mapping
+# Basado en el esquema de colores del dataset ADE20K.
+# Las categorías sin un mapeo directo se han asignado a colores lógicos o por defecto.
+# Unmapped Default Color: #FF00FF (Magenta)
 Category,Color
-Walls,#FFFFFF
-Floors,#808080
-Ceilings,#C8C8C8
-Windows,#64C8FF
-Doors,#966432
-Furniture,#FFC864
-Structural Columns,#C86464
-Stairs,#A0A0A0
-Generic Models,#FF64FF
+# --- CATEGORÍAS ARQUITECTÓNICAS PRINCIPALES ---
+OST_Walls,#787878
+OST_Floors,#503232
+OST_Ceilings,#787850
+OST_Roofs,#B47878
+OST_Windows,#E6E6E6
+OST_Doors,#08FF33
+OST_Stairs,#FFE000
+OST_Railings,#FF3D06
+OST_CurtainWallPanels,#E6E6E6
+# --- CATEGORÍAS ESTRUCTURALES ---
+OST_StructuralColumns,#FF0829
+OST_StructuralFraming,#FF00FF
+OST_StructuralFoundation,#503232
+# --- MOBILIARIO Y EQUIPO ---
+OST_Furniture,#FF0652
+OST_Casework,#E005FF
+OST_PlumbingFixtures,#00A3FF
+OST_GenericModel,#00FF14
+# --- ELEMENTOS DE ENTORNO Y EXTERIOR ---
+OST_Entourage,#96053D
+OST_Planting,#04C803
+OST_Topography,#787846
+# --- CATEGORÍAS MEP (Mecánica, Electricidad, Fontanería) ---
+OST_DuctCurves,#DCDCDC
+OST_PipeCurves,#FF7A08
+OST_CableTray,#FFB806
+OST_Conduit,#FFC207
+OST_LightingFixtures,#FFAD00
+OST_MechanicalEquipment,#14FF00
+# --- OTRAS CATEGORÍAS COMUNES ---
+OST_Ramps,#503232
+OST_Parking,#8C8C8C
+OST_Roads,#8C8C8C

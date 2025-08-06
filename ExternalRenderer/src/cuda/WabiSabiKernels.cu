@@ -335,18 +335,17 @@ void LaunchLinesKernel(
 }
 
 void LaunchSegmentationKernel(
-    const float3* d_vertices, int vertexCount, const int* d_triangles, const int* d_categoryIds,
-    const float3* d_categoryColors, int triangleCount, int categoryCount, // <--- PARÁMETRO AÑADIDO
+    const float3* d_vertices, int vertexCount, const int* d_triangles, const int* d_categoryIds, // <-- AÑADIR d_categoryIds
+    const float3* d_categoryColors, int triangleCount, int categoryCount, // <-- AÑADIR categoryCount
     const CameraData& camera, const RenderConfig& config, float4* d_segmentationMap, cudaStream_t stream)
 {
-    // Define el tamaño de los bloques de hilos (threads)
     dim3 blockSize(16, 16);
-    // Calcula el tamaño de la parrilla (grid) de bloques necesario para cubrir toda la imagen
     dim3 gridSize((config.width + blockSize.x - 1) / blockSize.x, (config.height + blockSize.y - 1) / blockSize.y);
     
-    // Lanza el kernel en la GPU, pasando todos los parámetros, incluyendo el `categoryCount`
+    // --- INICIO DE LA CORRECCIÓN: PASAR LOS NUEVOS PARÁMETROS ---
     RenderSegmentationMap<<<gridSize, blockSize, 0, stream>>>(
         d_vertices, vertexCount, d_triangles, d_categoryIds, d_categoryColors,
-        triangleCount, categoryCount, // <-- El parámetro crucial se pasa aquí
+        triangleCount, categoryCount, 
         camera, config, d_segmentationMap);
+    // --- FIN DE LA CORRECCIÓN ---
 }

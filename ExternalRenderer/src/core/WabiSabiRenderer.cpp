@@ -21,13 +21,13 @@
 struct GeometryHeader {
     int32_t vertexCount;
     int32_t triangleCount;
-    int32_t categoryCount;
+    int32_t categoryCount;         // <-- CAMPO NUEVO
     int64_t verticesOffset;
     int64_t indicesOffset;
     int64_t normalsOffset;
-    int64_t elementIdsOffset;
-    int64_t categoryIdsOffset;
-    int64_t categoryMappingOffset;
+    int64_t elementIdsOffset;      // <-- CAMPO NUEVO
+    int64_t categoryIdsOffset;     // <-- CAMPO NUEVO
+    int64_t categoryMappingOffset; // <-- CAMPO NUEVO
 };
 #pragma pack(pop)
 
@@ -120,6 +120,44 @@ void WabiSabiRenderer::ReadGeometryHeader() {
     std::cout << "  - categoryMappingOffset: " << header->categoryMappingOffset << std::endl;
 
     char* basePtr = static_cast<char*>(geometryMMF);
+
+    // --- INICIO DE LA MODIFICACIÓN ---
+    // Leer el mapa de categorías desde el MMF
+    char* mapPtr = basePtr + header->categoryMappingOffset;
+    
+    // Leer el número de entradas en el mapa
+    int mapEntryCount = *reinterpret_cast<int*>(mapPtr);
+    mapPtr += sizeof(int);
+    
+    categoryIndexToNameMap.clear();
+    std::cout << "[MMF] Leyendo mapa de categorías..." << std::endl;
+    for (int i = 0; i < mapEntryCount; ++i) {
+        // Leer el índice compacto
+        int compactIndex = *reinterpret_cast<int*>(mapPtr);
+        mapPtr += sizeof(int);
+        
+        // Leer el nombre de la categoría (string prefijado por su longitud)
+        // BinaryWriter de .NET escribe un 7-bit encoded int para la longitud.
+        // Es complejo de leer, una alternativa es cambiar la escritura en C# o
+        // usar un formato fijo.
+        // SOLUCIÓN MÁS SIMPLE: Asumamos que BinaryWriter escribe la longitud primero.
+        // Para strings pequeños, esto suele ser un solo byte.
+        // Vamos a leerlo de la forma que lo escribe BinaryWriter
+        int stringLength = 0;
+        unsigned char byteRead;
+        int shift = 0;
+        do {
+            byteRead = *reinterpret_cast<unsigned char*>(mapPtr++);
+            stringLength |= (byteRead & 0x7F) << shift;
+            shift += 7;
+        } while ((byteRead & 0x80) != 0);
+
+        std::string categoryName(mapPtr, stringLength);
+        mapPtr += stringLength;
+        
+        categoryIndexToNameMap[compactIndex] = categoryName;
+        std::cout << "  - Mapeo leído: " << compactIndex << " -> " << categoryName << std::endl;
+    }
     float* h_vertices = reinterpret_cast<float*>(basePtr + header->verticesOffset);
     int* h_triangles = reinterpret_cast<int*>(basePtr + header->indicesOffset);
     float* h_normals = reinterpret_cast<float*>(basePtr + header->normalsOffset);
@@ -183,31 +221,47 @@ void WabiSabiRenderer::ReadGeometryHeader() {
 }
 
 void WabiSabiRenderer::LoadColorMappingCSV() {
-    std::cout << "[CSV] Cargando mapeo de colores desde: " << config.csvPath << std::endl;
+    std::cout << "[CSV] Cargando colores desde: " << config.csvPath << std::endl;
     
-    auto colorList = CSVReader::ReadCategoryColors(config.csvPath);
-    
+    // --- INICIO DE LA MODIFICACIÓN ---
+
+    // 1. Cargar los colores del CSV a un mapa de [Nombre -> Color]
+    auto colorsFromFile = CSVReader::ReadCategoryColors(config.csvPath);
+    std::unordered_map<std::string, float3> nameToColorMap;
+    for (const auto& entry : colorsFromFile) {
+        nameToColorMap[entry.category] = entry.color;
+    }
+
+    // 2. Construir la tabla final de colores para la GPU (h_categoryColors)
+    //    usando el mapa que leímos del MMF.
     h_categoryColors.assign(256, make_float3(0.5f, 0.5f, 0.5f)); // Rellena con gris por defecto
 
-    // Mapear categorías en el orden del CSV
-    // Asumimos que el plugin de Revit asigna IDs 0, 1, 2... que corresponden
-    // al orden de las categorías en el archivo CSV (después del encabezado).
-    // NOTA: Se ignora la primera entrada ("Category", "Color") si está presente.
-    int categoryIndex = 0;
-    for (const auto& entry : colorList) {
-        // Simple heurística para saltar la fila del header si el lector la incluyó
-        if (entry.category == "Category") continue; 
-        
-        if (categoryIndex < 256) {
-            h_categoryColors[categoryIndex] = entry.color;
-            categoryIndex++;
+    // Iterar sobre nuestro mapa de [índice -> nombre] leído del MMF
+    for(const auto& kvp : categoryIndexToNameMap) {
+        int compactIndex = kvp.first;
+        const std::string& categoryName = kvp.second;
+
+        if (compactIndex < 256) {
+            // Buscar el color para este nombre de categoría en el mapa del CSV
+            auto it = nameToColorMap.find(categoryName);
+            if (it != nameToColorMap.end()) {
+                // Si se encuentra, colocar el color en la posición correcta del array
+                h_categoryColors[compactIndex] = it->second;
+            } else {
+                // Si no se encuentra, se quedará el color gris por defecto.
+                std::cout << "[Advertencia] No se encontró color para la categoría '" << categoryName 
+                          << "' (Índice " << compactIndex << ") en el CSV." << std::endl;
+            }
         }
     }
+    // --- FIN DE LA MODIFICACIÓN ---
     
-    // Copiar a GPU
+    // Copiar el array final y ordenado a la GPU
     CUDA_CHECK(cudaMalloc(&d_categoryColors, 256 * sizeof(float3)));
     CUDA_CHECK(cudaMemcpy(d_categoryColors, h_categoryColors.data(), 
                           256 * sizeof(float3), cudaMemcpyHostToDevice));
+    
+    std::cout << "[CSV] Tabla de colores para GPU creada y transferida." << std::endl;
 }
 
 void WabiSabiRenderer::RenderAllMaps(const CameraData& camera) {
@@ -287,10 +341,10 @@ void WabiSabiRenderer::RenderAllMaps(const CameraData& camera) {
             reinterpret_cast<float3*>(d_vertices),
             vertexCount,
             d_triangles,
-            d_categoryIds,
+            d_categoryIds, // <-- Pasar el nuevo buffer de IDs de categoría
             d_categoryColors,
             triangleCount,
-            categoryCount, // <--- ARGUMENTO DESCOMENTADO Y RESTAURADO
+            categoryCount, // <-- Pasar el número de categorías
             kernelCamera, 
             kernelConfig,
             reinterpret_cast<float4*>(d_segmentationMap),

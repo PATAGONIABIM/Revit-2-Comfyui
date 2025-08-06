@@ -52,7 +52,7 @@ void LaunchLinesKernel(
 
 // DECLARACIÓN PARA SEGMENTACIÓN
 void LaunchSegmentationKernel(
-    const float3* d_vertices, int vertexCount, const int* d_triangles, const int* d_categoryIds,
-    const float3* categoryColors, int triangleCount, int categoryCount,
+    const float3* d_vertices, int vertexCount, const int* d_triangles, const int* d_categoryIds, // <-- AÑADIR d_categoryIds
+    const float3* categoryColors, int triangleCount, int categoryCount, // <-- AÑADIR categoryCount
     const CameraData& camera, const RenderConfig& config, float4* d_segmentationMap, cudaStream_t stream
 );
