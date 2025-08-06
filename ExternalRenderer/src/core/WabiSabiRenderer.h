@@ -104,6 +104,10 @@ private:
     std::atomic<uint64_t> totalFrames;
     std::atomic<float> currentFPS;
     std::atomic<float> avgFrameTime;
+
+    std::string lastKnownTimestamp; // Para guardar la última marca de tiempo leída
+    void CheckForUpdates();         // Nuevo método para verificar si hay cambios
+    void ReloadGeometry();  
     
     void RenderLoop();
     void OpenGeometryMMF();

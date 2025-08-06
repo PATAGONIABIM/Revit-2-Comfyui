@@ -36,31 +36,73 @@ WabiSabiRenderer::WabiSabiRenderer(const RenderConfig& config)
     
     std::cout << "[RENDERER] Inicializando WabiSabiRenderer..." << std::endl;
     
-    // Inicializar CUDA
     CUDA_CHECK(cudaSetDevice(config.cudaDevice));
     printCudaDeviceInfo(config.cudaDevice);
     
-    // Abrir Memory Mapped Files
-    OpenGeometryMMF();
-    
-    // Alocar buffers de salida en GPU
+    // Alocar buffers de salida en GPU (esto solo se hace una vez)
     size_t pixelCount = config.width * config.height;
     CUDA_CHECK(cudaMalloc(&d_depthMap, pixelCount * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_normalMap, pixelCount * 3 * sizeof(float))); // Es float3, así que son 3 floats
+    CUDA_CHECK(cudaMalloc(&d_normalMap, pixelCount * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_linesMap, pixelCount * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_segmentationMap, pixelCount * 4 * sizeof(float))); // Es float4, así que son 4 floats
+    CUDA_CHECK(cudaMalloc(&d_segmentationMap, pixelCount * 4 * sizeof(float)));
 
-    // --- ELIMINA LAS SIGUIENTES LÍNEAS ---
-    // currentCamera.eyePosition = make_float3(10.0f, 10.0f, 10.0f);
-    // currentCamera.viewDirection = make_float3(-1.0f, -1.0f, -1.0f);
-    // currentCamera.upDirection = make_float3(0.0f, 0.0f, 1.0f);
-    // currentCamera.rightDirection = make_float3(1.0f, 0.0f, 0.0f);
-    // --- FIN DE LA ELIMINACIÓN ---
-    
-    // Cargar mapeo de colores
-    LoadColorMappingCSV();
+    // La carga inicial de geometría Y colores ahora se hace a través de ReloadGeometry
+    ReloadGeometry();
     
     std::cout << "[RENDERER] Inicialización completa" << std::endl;
+}
+
+void WabiSabiRenderer::CheckForUpdates()
+{
+    try
+    {
+        std::string notificationFilePath = config.outputPath + "/last_update.txt";
+        if (!std::filesystem::exists(notificationFilePath)) {
+            return; // Si no hay archivo, no hay nada que hacer
+        }
+
+        std::ifstream file(notificationFilePath);
+        std::string currentTimestamp;
+        file >> currentTimestamp;
+        file.close();
+
+        if (currentTimestamp != lastKnownTimestamp)
+        {
+            std::cout << "\n[UPDATE] ¡Cambio detectado! Nueva marca de tiempo: " << currentTimestamp << std::endl;
+            lastKnownTimestamp = currentTimestamp;
+            ReloadGeometry();
+            std::cout << "[UPDATE] Geometría recargada exitosamente.\n" << std::endl;
+        }
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "[ERROR] Fallo al comprobar actualizaciones: " << e.what() << std::endl;
+    }
+}
+
+void WabiSabiRenderer::ReloadGeometry()
+{
+    // --- PASO 1: Liberar recursos antiguos ---
+    if (d_vertices) cudaFree(d_vertices);
+    if (d_triangles) cudaFree(d_triangles);
+    if (d_normals) cudaFree(d_normals);
+    if (d_elementIds) cudaFree(d_elementIds);
+    if (d_categoryIds) cudaFree(d_categoryIds);
+    d_vertices = nullptr; d_triangles = nullptr; d_normals = nullptr;
+    d_elementIds = nullptr; d_categoryIds = nullptr;
+    if (geometryMMF) {
+        UnmapViewOfFile(geometryMMF);
+        geometryMMF = nullptr;
+    }
+
+    // --- PASO 2: Cargar nueva geometría desde el MMF ---
+    std::cout << "[RELOAD] Abriendo MMF y copiando datos a la GPU..." << std::endl;
+    OpenGeometryMMF(); // Esto lee el header y carga los datos de geometría.
+    
+    // --- PASO 3 (LA SOLUCIÓN): Reconstruir la tabla de colores AHORA ---
+    // Usando el categoryIndexToNameMap que se acaba de cargar desde el MMF.
+    // Esto se ejecutará tanto en el inicio como en cada actualización.
+    LoadColorMappingCSV(); 
 }
 
 void WabiSabiRenderer::OpenGeometryMMF() {
@@ -132,32 +174,25 @@ void WabiSabiRenderer::ReadGeometryHeader() {
     categoryIndexToNameMap.clear();
     std::cout << "[MMF] Leyendo mapa de categorías..." << std::endl;
     for (int i = 0; i < mapEntryCount; ++i) {
-        // Leer el índice compacto
-        int compactIndex = *reinterpret_cast<int*>(mapPtr);
-        mapPtr += sizeof(int);
-        
-        // Leer el nombre de la categoría (string prefijado por su longitud)
-        // BinaryWriter de .NET escribe un 7-bit encoded int para la longitud.
-        // Es complejo de leer, una alternativa es cambiar la escritura en C# o
-        // usar un formato fijo.
-        // SOLUCIÓN MÁS SIMPLE: Asumamos que BinaryWriter escribe la longitud primero.
-        // Para strings pequeños, esto suele ser un solo byte.
-        // Vamos a leerlo de la forma que lo escribe BinaryWriter
-        int stringLength = 0;
-        unsigned char byteRead;
-        int shift = 0;
-        do {
-            byteRead = *reinterpret_cast<unsigned char*>(mapPtr++);
-            stringLength |= (byteRead & 0x7F) << shift;
-            shift += 7;
-        } while ((byteRead & 0x80) != 0);
+    // Leer el índice compacto
+    int compactIndex = *reinterpret_cast<int*>(mapPtr);
+    mapPtr += sizeof(int);
 
-        std::string categoryName(mapPtr, stringLength);
-        mapPtr += stringLength;
-        
-        categoryIndexToNameMap[compactIndex] = categoryName;
-        std::cout << "  - Mapeo leído: " << compactIndex << " -> " << categoryName << std::endl;
-    }
+    // --- INICIO DE LA MODIFICACIÓN ---
+    // Eliminar el bucle do-while complejo.
+    
+    // 1. Leer la longitud de la cadena como un int estándar.
+    int stringLength = *reinterpret_cast<int*>(mapPtr);
+    mapPtr += sizeof(int);
+
+    // 2. Leer exactamente esa cantidad de bytes para formar la cadena.
+    std::string categoryName(mapPtr, stringLength);
+    mapPtr += stringLength;
+    // --- FIN DE LA MODIFICACIÓN ---
+    
+    categoryIndexToNameMap[compactIndex] = categoryName;
+    std::cout << "  - Mapeo leído: " << compactIndex << " -> " << categoryName << std::endl;
+}
     float* h_vertices = reinterpret_cast<float*>(basePtr + header->verticesOffset);
     int* h_triangles = reinterpret_cast<int*>(basePtr + header->indicesOffset);
     float* h_normals = reinterpret_cast<float*>(basePtr + header->normalsOffset);
@@ -266,7 +301,8 @@ void WabiSabiRenderer::LoadColorMappingCSV() {
 
 void WabiSabiRenderer::RenderAllMaps(const CameraData& camera) {
     if (!d_vertices || vertexCount == 0 || triangleCount == 0) {
-        std::cerr << "[RENDERER] No hay geometría para renderizar" << std::endl;
+        // No imprimir error constantemente, solo esperar.
+        // std::cerr << "[RENDERER] No hay geometría para renderizar" << std::endl;
         return;
     }
     
@@ -510,6 +546,7 @@ void WabiSabiRenderer::RenderLoop() {
     auto lastFrameTime = std::chrono::steady_clock::now();
     
     while (isRunning) {
+        CheckForUpdates(); // <-- ¡LÓGICA DE ACTUALIZACIÓN AÑADIDA AQUÍ!
         auto frameStart = std::chrono::steady_clock::now();
         
         // Obtener última posición de cámara

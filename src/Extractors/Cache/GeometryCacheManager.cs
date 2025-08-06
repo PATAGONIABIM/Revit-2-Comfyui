@@ -415,7 +415,7 @@ namespace WabiSabiBridge.Extractors.Cache
                     CategoryIdsOffset = headerSize + vertexDataSize + indexDataSize + normalDataSize + elementIdDataSize,
                     CategoryMappingOffset = headerSize + vertexDataSize + indexDataSize + normalDataSize + elementIdDataSize + categoryIdDataSize
                 };
-                
+
                 long totalSize = headerSize + vertexDataSize + indexDataSize + normalDataSize + 
                                 elementIdDataSize + categoryIdDataSize + categoryMapDataSize;
                 
@@ -471,11 +471,27 @@ namespace WabiSabiBridge.Extractors.Cache
                 {
                     int compactId = revitIdToCompactId.Count;
                     revitIdToCompactId[revitCatId] = compactId;
-                    
-                    string categoryName = Enum.IsDefined(typeof(BuiltInCategory), element.Category.Id.Value) 
-                        ? ((BuiltInCategory)element.Category.Id.Value).ToString() 
-                        : "Unknown";
-                    masterCategoryMap[compactId] = categoryName;
+
+                    // --- INICIO DE LA CORRECCIÓN ---
+                    // La clave es obtener el nombre programático (ej. "OST_Walls") para que coincida con el CSV,
+                    // en lugar del nombre localizado (ej. "Muros").
+                    string categoryKey;
+                    try
+                    {
+                        // Intenta obtener el nombre de la BuiltInCategory directamente.
+                        // Esto es más robusto que comprobar la definición del Enum.
+                        BuiltInCategory bic = (BuiltInCategory)element.Category.Id.Value;
+                        categoryKey = bic.ToString();
+                    }
+                    catch
+                    {
+                        // Si falla la conversión, usar el nombre real como fallback pero
+                        // asegurándose de que no contenga caracteres problemáticos.
+                        categoryKey = element.Category.Name;
+                    }
+
+                    masterCategoryMap[compactId] = categoryKey;
+                    // --- FIN DE LA CORRECCIÓN ---
                 }
             }
             updateStatusCallback?.Invoke($"Fase 1/4: {masterCategoryMap.Count} categorías únicas encontradas.", Drawing.Color.Blue);
@@ -650,14 +666,19 @@ namespace WabiSabiBridge.Extractors.Cache
         private byte[] SerializeCategoryMap(Dictionary<int, string> categoryMap)
         {
             using (var ms = new MemoryStream())
-            using (var writer = new BinaryWriter(ms))
+            using (var writer = new BinaryWriter(ms, Encoding.UTF8, false)) // Usar UTF8 explícitamente
             {
-                // El formato es: [count], luego repetidamente [int key, string value]
                 writer.Write(categoryMap.Count);
                 foreach (var kvp in categoryMap)
                 {
-                    writer.Write(kvp.Key);       // Escribe el índice compacto (ej: 0, 1, 2...)
-                    writer.Write(kvp.Value);     // Escribe el nombre de la categoría (ej: "Walls")
+                    writer.Write(kvp.Key); // Escribe el índice compacto
+
+                    // --- INICIO DE LA MODIFICACIÓN ---
+                    // No usar writer.Write(string) para evitar la codificación de 7 bits.
+                    byte[] stringBytes = Encoding.UTF8.GetBytes(kvp.Value);
+                    writer.Write(stringBytes.Length); // Escribir la longitud como un int estándar.
+                    writer.Write(stringBytes);        // Escribir los bytes crudos de la cadena.
+                    // --- FIN DE LA MODIFICACIÓN ---
                 }
                 return ms.ToArray();
             }

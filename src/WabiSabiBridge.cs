@@ -45,6 +45,43 @@ using System.Text.RegularExpressions;
 
 namespace WabiSabiBridge
 {
+    #region Action Handler para diferir llamadas a la API
+
+    /// <summary>
+    /// Un manejador de eventos genérico para ejecutar acciones en un contexto válido de Revit.
+    /// Resuelve el problema de "Invalid API context" al ser llamado desde la UI.
+    /// </summary>
+    public class ActionEventHandler : IExternalEventHandler
+    {
+        // Usamos una cola para asegurar que las acciones se procesan en orden y no se pierden.
+        private readonly ConcurrentQueue<Action> _actions = new ConcurrentQueue<Action>();
+
+        public void EnqueueAction(Action action)
+        {
+            _actions.Enqueue(action);
+        }
+
+        public void Execute(UIApplication app)
+        {
+            // Ejecuta todas las acciones pendientes en la cola.
+            while (_actions.TryDequeue(out Action? action))
+            {
+                try
+                {
+                    action?.Invoke();
+                }
+                catch (Exception ex)
+                {
+                    WabiSabiLogger.LogError("Error ejecutando acción diferida", ex);
+                }
+            }
+        }
+
+        public string GetName() => "WabiSabi UI Action Handler";
+    }
+
+    #endregion
+
     #region Clases de la Interfaz de Usuario y Comandos (Sin cambios)
 
     /// <summary>
@@ -572,12 +609,13 @@ namespace WabiSabiBridge
             WabiSabiLogger.Log("Metadata exportada", LogLevel.Debug);
         }
 
-        private static void CreateNotificationFile(string outputPath, string timestamp)
-        {
-            WabiSabiLogger.LogDiagnostic("Export", "Creando archivo de notificación...");
-            File.WriteAllText(Path.Combine(outputPath, "last_update.txt"), timestamp);
-            WabiSabiLogger.Log("Archivo de notificación creado", LogLevel.Debug);
-        }
+        // --- MÉTODO MOVIDO A WabiSabiBridgeApp ---
+        // private static void CreateNotificationFile(string outputPath, string timestamp)
+        // {
+        //     WabiSabiLogger.LogDiagnostic("Export", "Creando archivo de notificación...");
+        //     File.WriteAllText(Path.Combine(outputPath, "last_update.txt"), timestamp);
+        //     WabiSabiLogger.Log("Archivo de notificación creado", LogLevel.Debug);
+        // }
 
         public void Dispose() { _depthExtractor?.Dispose(); _depthExtractorFast?.Dispose(); }
 
@@ -663,6 +701,7 @@ namespace WabiSabiBridge
         private WinForms.Button _clearCacheButton = null!;
         private WinForms.ComboBox _geometryCacheQualityCombo = null!;
         private WinForms.Timer _cacheStatusTimer = null!;
+        private WinForms.Button _liveLinkButton = null!;
         
         public WabiSabiBridgeWindow(UIApplication uiApp) // <-- Constructor nuevo y simplificado
         {
@@ -740,21 +779,102 @@ namespace WabiSabiBridge
             
             outputGroup.Controls.AddRange(new WinForms.Control[] { outputLabel, _outputPathTextBox, browseButton });
             
-            // === BOTÓN PRINCIPAL DE EXPORTAR ===
-            var exportButton = new WinForms.Button
+            // === BOTÓN PRINCIPAL DE LIVE LINK ===
+            _liveLinkButton = new WinForms.Button
             {
-                Text = "EXPORTAR VISTA ACTUAL",
+                Name = "liveLinkButton", // Nombre para identificarlo
+                Text = "Iniciar Live Link", // Texto inicial
                 Location = new Drawing.Point(15, 105),
                 Size = new Drawing.Size(455, 45),
                 Font = new Drawing.Font("Segoe UI", 10F, Drawing.FontStyle.Bold),
-                BackColor = Drawing.Color.FromArgb(0, 120, 215),
+                BackColor = Drawing.Color.SteelBlue, // Un color inicial neutro
                 ForeColor = Drawing.Color.White,
                 FlatStyle = WinForms.FlatStyle.Flat,
                 Cursor = WinForms.Cursors.Hand
             };
-            exportButton.FlatAppearance.BorderSize = 0;
-            exportButton.Click += (s, e) => ExportCurrentView();
-            
+            _liveLinkButton.FlatAppearance.BorderSize = 0;
+
+            // --- INICIO DE LA LÓGICA CORREGIDA PARA EL BOTÓN LIVE LINK ---
+            _liveLinkButton.Click += async (s, e) => 
+            {
+                // Si el Live Link ya está activo, la única acción es detenerlo.
+                if (WabiSabiBridgeApp.IsLiveLinkActive)
+                {
+                    WabiSabiBridgeApp.StopLiveLink();
+                    UpdateStatus("Live Link detenido.", Drawing.Color.Orange);
+                    UpdateLiveLinkButtonState();
+                    return;
+                }
+
+                // Si no está activo, iniciamos el proceso: 1. Construir Caché -> 2. Activar Live Link
+                _liveLinkButton.Enabled = false;
+                UpdateStatus("Iniciando Live Link... Construyendo caché inicial...", Drawing.Color.Blue);
+                
+                try
+                {
+                    var doc = _uiApp.ActiveUIDocument.Document;
+                    var view3D = doc.ActiveView as View3D;
+
+                    if (view3D == null)
+                    {
+                        UpdateStatus("Error: No hay una vista 3D activa.", Drawing.Color.Red);
+                        return;
+                    }
+
+                    // Usamos una ventana de progreso para la construcción del caché inicial.
+                    bool cacheBuiltSuccessfully = false;
+                    using (var progressDialog = new ModernProgressDialog("Inicializando Live Link"))
+                    {
+                        var result = await progressDialog.RunAsync(async (progress, cancellationToken) =>
+                        {
+                            // CORRECCIÓN: Se define explícitamente el tipo System.Drawing.Color
+                            // y se extrae el porcentaje del mensaje para un mejor feedback.
+                            Action<string, System.Drawing.Color> progressCallback = (msg, color) =>
+                            {
+                                int percent = 0;
+                                // Intenta extraer un porcentaje del mensaje (ej. "Procesando 50%...")
+                                if (System.Text.RegularExpressions.Regex.Match(msg, @"(\d+)%") is var match && match.Success)
+                                {
+                                    percent = int.Parse(match.Groups[1].Value);
+                                }
+                                progress.Report((percent, msg));
+                            };
+
+                            var cacheData = await GeometryCacheManager.Instance.EnsureCacheIsValidAsync(doc, view3D, progressCallback, cancellationToken);
+                            return cacheData.IsValid;
+                        });
+                        cacheBuiltSuccessfully = result;
+                    }
+
+                    if (cacheBuiltSuccessfully)
+                    {
+                        // Solo si el caché se construyó correctamente, activamos el Live Link.
+                        WabiSabiBridgeApp.StartLiveLink(_uiApp);
+                        UpdateStatus("Live Link ACTIVO. Escuchando cambios en el modelo.", Drawing.Color.Green);
+                        UpdateCacheStatus(); // Refrescar la UI del caché
+                    }
+                    else
+                    {
+                        UpdateStatus("Error: No se pudo construir el caché de geometría. Live Link no iniciado.", Drawing.Color.Red);
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    UpdateStatus("Operación cancelada por el usuario.", Drawing.Color.Orange);
+                }
+                catch (Exception ex)
+                {
+                    UpdateStatus($"Error fatal al iniciar Live Link: {ex.Message}", Drawing.Color.Red);
+                    WabiSabiLogger.LogError("Error en el Click de Live Link", ex);
+                }
+                finally
+                {
+                    _liveLinkButton.Enabled = true;
+                    UpdateLiveLinkButtonState();
+                }
+            };
+            // --- FIN DE LA LÓGICA CORREGIDA ---
+
             // === SECCIÓN 2: Opciones de exportación ===
             var exportOptionsGroup = new WinForms.GroupBox
             {
@@ -1053,7 +1173,7 @@ namespace WabiSabiBridge
             
             // Agregar todos los controles al panel principal
             mainPanel.Controls.AddRange(new WinForms.Control[] {
-                outputGroup, exportButton, exportOptionsGroup, cacheGroup, additionalGroup, statusPanel
+                outputGroup, _liveLinkButton, exportOptionsGroup, cacheGroup, additionalGroup, statusPanel
             });
             
             Controls.Add(mainPanel);
@@ -1164,9 +1284,13 @@ namespace WabiSabiBridge
             UpdateCacheStatus();
         };
             
-            // Timer para actualizar el estado del caché
+            // Timer para actualizar el estado del caché y el botón de Live Link
             _cacheStatusTimer = new WinForms.Timer { Interval = 1000 };
-            _cacheStatusTimer.Tick += (s, e) => UpdateCacheStatus();
+            _cacheStatusTimer.Tick += (s, e) => 
+            {
+                UpdateCacheStatus();
+                UpdateLiveLinkButtonState(); // Comprobar el estado real periódicamente
+            };
             _cacheStatusTimer.Start();
             
             // Inicializar estados
@@ -1174,7 +1298,24 @@ namespace WabiSabiBridge
             UpdateGpuControls();
             UpdateTimeEstimate();
             CheckGpuStatus();
+            UpdateLiveLinkButtonState();
             #endregion
+        }
+        
+        private void UpdateLiveLinkButtonState()
+        {
+            if (InvokeRequired) { Invoke(new Action(UpdateLiveLinkButtonState)); return; }
+
+            if (WabiSabiBridgeApp.IsLiveLinkActive)
+            {
+                _liveLinkButton.Text = "Live Link ACTIVO (Haga clic para detener)";
+                _liveLinkButton.BackColor = Drawing.Color.ForestGreen;
+            }
+            else
+            {
+                _liveLinkButton.Text = "Iniciar Live Link";
+                _liveLinkButton.BackColor = Drawing.Color.SteelBlue;
+            }
         }
         
         public void ExportCurrentView()
@@ -1342,11 +1483,19 @@ namespace WabiSabiBridge
         private static Task? _exportWorker;
         private static CancellationTokenSource? _exportCts;
         
-
+        // --- INICIO DE CAMPOS CORREGIDOS PARA LIVE LINK ---
+        private static UIControlledApplication? _controlledApp;
+        public static bool IsLiveLinkActive { get; private set; } = false;
+        internal static ActionEventHandler? UiActionHandler;
+        internal static ExternalEvent? UiActionEvent;
+        private static System.Threading.Timer? _liveUpdateDebounceTimer;
+        private static readonly int DEBOUNCE_TIME_MS = 500;
+        // --- FIN DE CAMPOS CORREGIDOS PARA LIVE LINK ---
         
 
         public Result OnStartup(UIControlledApplication application)
         {
+            _controlledApp = application; // Guardamos la aplicación controlada
             try
             {
                 WabiSabiLogger.Log("WabiSabi Bridge - INICIANDO", LogLevel.Info);
@@ -1357,14 +1506,18 @@ namespace WabiSabiBridge
                 WabiSabiLogger.Log($"Gestor de GPU inicializado. Disponible: {GpuManager.IsGpuAvailable}", LogLevel.Info);
                 // 1. Inicializar componentes básicos de Revit
                 if (!CreateRibbon(application)) return Result.Failed;
-                if (!InitializeEventHandler()) return Result.Failed; // Para la exportación manual
+                if (!InitializeEventHandler()) return Result.Failed;
+
+                // --- INICIO DE MODIFICACIÓN: INICIALIZAR EL NUEVO HANDLER ---
+                UiActionHandler = new ActionEventHandler();
+                UiActionEvent = ExternalEvent.Create(UiActionHandler);
+                // --- FIN DE MODIFICACIÓN ---
 
                 // 2. Crear el gestor de auto-exportación. Se quedará a la espera.
                 string cacheDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "WabiSabiBridge", "GeometryCache");
                 AutoExportManager = new OptimizedAutoExportManager(cacheDir);
 
                 // 3. Suscribirse a eventos de Revit para la invalidación automática del caché
-                application.ControlledApplication.DocumentChanged += OnDocumentChanged;
                 application.ControlledApplication.DocumentOpened += OnDocumentOpened;
 
                 // 4. Iniciar el hilo de trabajo para guardar archivos
@@ -1387,6 +1540,7 @@ namespace WabiSabiBridge
             try
             {
                 WabiSabiLogger.Log("WabiSabi Bridge - CERRANDO", LogLevel.Info);
+                StopLiveLink(); // Asegurarse de que se desuscriba al cerrar Revit
 
                 // Detener el gestor de auto-exportación si está corriendo
                 AutoExportManager?.StopAutoExport();
@@ -1396,9 +1550,11 @@ namespace WabiSabiBridge
                 _exportWorker?.Wait(TimeSpan.FromSeconds(2));
 
                 // Desuscribirse de los eventos
-                application.ControlledApplication.DocumentChanged -= OnDocumentChanged;
-                application.ControlledApplication.DocumentOpened -= OnDocumentOpened;
-
+                if (_controlledApp != null)
+                {
+                   _controlledApp.ControlledApplication.DocumentOpened -= OnDocumentOpened;
+                }
+                
                 GpuManager?.Dispose();
                 return Result.Succeeded;
             }
@@ -1408,30 +1564,119 @@ namespace WabiSabiBridge
                 return Result.Failed;
             }
         }
+        
+        // --- INICIO DE MÉTODOS PÚBLICOS CORREGIDOS ---
+        public static void StartLiveLink(UIApplication uiApp)
+        {
+            if (_controlledApp == null || IsLiveLinkActive || UiActionHandler == null || UiActionEvent == null) return;
+            
+            _currentUiApp = uiApp; // Guardar la instancia de la aplicación actual
+
+            Action subscribeAction = () => 
+            {
+                if (!IsLiveLinkActive)
+                {
+                    _controlledApp.ControlledApplication.DocumentChanged += OnDocumentChanged;
+                    _liveUpdateDebounceTimer = new System.Threading.Timer(OnLiveUpdateTimerElapsed, null, Timeout.Infinite, Timeout.Infinite);
+                    IsLiveLinkActive = true;
+                    WabiSabiLogger.Log("Live Link INICIADO.", LogLevel.Info);
+                }
+            };
+            
+            UiActionHandler.EnqueueAction(subscribeAction);
+            UiActionEvent.Raise();
+        }
+
+        public static void StopLiveLink()
+        {
+            if (_controlledApp == null || !IsLiveLinkActive || UiActionHandler == null || UiActionEvent == null) return;
+
+            Action unsubscribeAction = () =>
+            {
+                if (IsLiveLinkActive)
+                {
+                    _controlledApp.ControlledApplication.DocumentChanged -= OnDocumentChanged;
+                    _liveUpdateDebounceTimer?.Dispose();
+                    _liveUpdateDebounceTimer = null;
+                    IsLiveLinkActive = false;
+                    _currentUiApp = null; // Limpiar la referencia
+                    WabiSabiLogger.Log("Live Link DETENIDO.", LogLevel.Info);
+                }
+            };
+
+            UiActionHandler.EnqueueAction(unsubscribeAction);
+            UiActionEvent.Raise();
+        }
+        // --- FIN DE MÉTODOS PÚBLICOS CORREGIDOS ---
+
+        // --- MANEJADOR DE EVENTOS PARA LIVE LINK ---
+        private static void OnDocumentChanged(object sender, DocumentChangedEventArgs e)
+        {
+            // Filtrar transacciones vacías
+            if (!e.GetAddedElementIds().Any() && !e.GetDeletedElementIds().Any() && !e.GetModifiedElementIds().Any())
+            {
+                return;
+            }
+
+            WabiSabiLogger.Log("Cambio detectado por Live Link. Invalidando caché y reiniciando temporizador...", LogLevel.Info);
+            GeometryCacheManager.Instance.InvalidateCache();
+            
+            // Reiniciar el temporizador de "debounce"
+            _liveUpdateDebounceTimer?.Change(DEBOUNCE_TIME_MS, Timeout.Infinite);
+        }
 
         /// <summary>
-        /// Se ejecuta cuando el documento cambia. Invalida el caché.
+        /// Este método es llamado por el temporizador de "debounce" en un hilo secundario.
+        /// Su única función es encolar la actualización real en el hilo de la UI de Revit.
         /// </summary>
-        private void OnDocumentChanged(object sender, DocumentChangedEventArgs e)
+        private static void OnLiveUpdateTimerElapsed(object? state)
         {
-            // Una detección de cambio simple es suficiente
-            if (e.GetAddedElementIds().Any() || e.GetDeletedElementIds().Any() || e.GetModifiedElementIds().Any())
+            if (UiActionHandler == null || UiActionEvent == null) return;
+            
+            WabiSabiLogger.Log("Temporizador de Live Link cumplido. Encolando actualización.", LogLevel.Debug);
+            UiActionHandler.EnqueueAction(ProcessLiveUpdate);
+            UiActionEvent.Raise();
+        }
+        
+        /// <summary>
+        /// Se ejecuta en el contexto válido de la API de Revit para procesar la actualización del Live Link.
+        /// </summary>
+        private static void ProcessLiveUpdate()
+        {
+            try
             {
-                WabiSabiLogger.Log("Cambios en el modelo detectados, invalidando caché.", LogLevel.Info);
-                GeometryCacheManager.Instance.InvalidateCache();
-
-                // Opcional: Si el auto-export está activo, podemos pedirle que reconstruya el caché.
-                if (AutoExportManager != null && AutoExportManager.IsRunning)
+                if (_currentUiApp?.ActiveUIDocument?.Document?.ActiveView is not View3D view3D)
                 {
-                    var doc = e.GetDocument();
-                    var activeView = doc.ActiveView as View3D;
-                    if (activeView != null)
-                    {
-                        _ = AutoExportManager.OnModelChanged(doc, activeView);
-                    }
+                    WabiSabiLogger.Log("Actualización de Live Link omitida: no hay una vista 3D activa.", LogLevel.Warning);
+                    return;
+                }
+
+                Document doc = _currentUiApp.ActiveUIDocument.Document;
+                WabiSabiLogger.Log("Procesando actualización de Live Link...", LogLevel.Info);
+
+                // 1. Reconstruir el caché (MMF) si es inválido. Esta es la operación costosa.
+                var cacheData = GeometryCacheManager.Instance.EnsureCacheIsValid(doc, view3D, (msg, color) => WabiSabiLogger.Log(msg, LogLevel.Debug));
+
+                if (cacheData.IsValid)
+                {
+                    // 2. Si el caché es ahora válido, simplemente crear el archivo de notificación.
+                    //    El renderizador externo verá este cambio y recargará el MMF.
+                    var config = WabiSabiConfig.Load();
+                    string timestamp = DateTime.Now.ToString("yyyyMMdd_HHmmssfff");
+                    CreateNotificationFile(config.OutputPath, timestamp);
+                    WabiSabiLogger.Log($"Notificación de actualización de Live Link enviada: {timestamp}", LogLevel.Info);
+                }
+                else
+                {
+                    WabiSabiLogger.LogError("Fallo al reconstruir el caché durante la actualización de Live Link.");
                 }
             }
+            catch (Exception ex)
+            {
+                WabiSabiLogger.LogError("Error fatal durante la ejecución de ProcessLiveUpdate.", ex);
+            }
         }
+        // --- FIN DEL MANEJADOR DE EVENTOS ---
 
         /// <summary>
         /// Se ejecuta al abrir un documento. Invalida cualquier caché antiguo.
@@ -1580,10 +1825,8 @@ namespace WabiSabiBridge
                         WabiSabiLogger.Log("Metadata guardada", LogLevel.Debug);
 
                         // --- 4. CREAR ARCHIVO DE NOTIFICACIÓN ---
-                        File.WriteAllText(Path.Combine(job.FinalOutputPath, "last_update.txt"), job.Timestamp);
-                        WabiSabiLogger.Log("Archivo de notificación creado", LogLevel.Debug);
-
-                        WabiSabiLogger.Log($"Trabajo {job.Timestamp} completado.", LogLevel.Info);
+                        CreateNotificationFile(job.FinalOutputPath, job.Timestamp);
+                        WabiSabiLogger.Log($"Trabajo {job.Timestamp} completado con notificación.", LogLevel.Info);
                     }
                     catch (Exception ex)
                     {
@@ -1746,17 +1989,17 @@ namespace WabiSabiBridge
         {
             try
             {
-                WabiSabiLogger.Log("Inicializando event handler...", LogLevel.Info);
+                WabiSabiLogger.Log("Inicializando event handler de exportación...", LogLevel.Info);
                 
                 WabiSabiEventHandler = new ExportEventHandler();
                 WabiSabiEvent = ExternalEvent.Create(WabiSabiEventHandler);
                 
-                WabiSabiLogger.Log("Event handler inicializado correctamente", LogLevel.Info);
+                WabiSabiLogger.Log("Event handler de exportación inicializado", LogLevel.Info);
                 return true;
             }
             catch (Exception ex)
             {
-                WabiSabiLogger.LogError("Error inicializando event handler", ex);
+                WabiSabiLogger.LogError("Error inicializando event handler de exportación", ex);
                 return false;
             }
         }       
@@ -1829,6 +2072,27 @@ namespace WabiSabiBridge
                 WabiSabiLogger.LogError("Error en TriggerAutoExport", ex);
             }
         }       
+        
+        /// <summary>
+        /// Crea o sobrescribe el archivo de notificación para el renderizador externo.
+        /// Este método es seguro para ser llamado desde el contexto de la API de Revit.
+        /// </summary>
+        public static void CreateNotificationFile(string outputPath, string timestamp)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(outputPath)) return;
+                WabiSabiLogger.LogDiagnostic("Export", "Creando archivo de notificación...");
+                string notificationPath = Path.Combine(outputPath, "last_update.txt");
+                File.WriteAllText(notificationPath, timestamp);
+                WabiSabiLogger.Log($"Archivo de notificación creado/actualizado en {notificationPath}", LogLevel.Debug);
+            }
+            catch(Exception ex)
+            {
+                 WabiSabiLogger.LogError("No se pudo crear el archivo de notificación.", ex);
+            }
+        }
+
 
         private void CleanupNonStreamingResources()
         {
@@ -1860,7 +2124,9 @@ namespace WabiSabiBridge
             sb.AppendLine("\n--- Estado General ---");
             sb.AppendLine($"- Plugin Inicializado: {_isInitialized}");
             sb.AppendLine($"- Handler de Exportación Manual: {(WabiSabiEventHandler != null ? "Cargado" : "Error")}");
-            
+            sb.AppendLine($"- Handler de Acciones UI: {(UiActionHandler != null ? "Cargado" : "Error")}");
+            sb.AppendLine($"- Live Link Activo: {IsLiveLinkActive}");
+
             // 2. Estado del Gestor de Auto-Exportación
             sb.AppendLine("\n--- Gestor de Auto-Exportación ---");
             if (AutoExportManager != null)
