@@ -3,10 +3,10 @@ WabiSabiBridge/
 │   ├── WabiSabiBridge.cs
 │   ├── Extractors/
 │   │   └── Cache/
-│   │       └── GeometryCacheManager.cs (MODIFICAR)
+│   │       └── GeometryCacheManager.cs 
 │   └── ...
 │
-└── ExternalRenderer/ (NUEVO)
+└── ExternalRenderer/ 
     ├── CMakeLists.txt
     ├── README.md
     ├── src/

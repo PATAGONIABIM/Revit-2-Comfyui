@@ -179,6 +179,30 @@
     <script>
         // Inicializar viewer
         const viewer = new WabiSabiViewer('container');
+
+        // Lógica de estado de conexión WebSocket
+        const statusIndicator = document.getElementById('status-indicator');
+        const statusText = document.getElementById('status-text');
+
+        viewer.ws.onopen = () => {
+            console.log("Conectado al servidor WebSocket");
+            statusIndicator.className = 'status-indicator connected';
+            statusText.textContent = 'Conectado';
+            // Importante: Identificarse como viewer al conectar
+            viewer.ws.send(JSON.stringify({ type: 'identify', client: 'viewer' }));
+        };
+
+        viewer.ws.onclose = () => {
+            console.log("Desconectado del servidor WebSocket");
+            statusIndicator.className = 'status-indicator';
+            statusText.textContent = 'Desconectado';
+        };
+        
+        viewer.ws.onerror = (error) => {
+            console.error("Error de WebSocket:", error);
+            statusIndicator.className = 'status-indicator';
+            statusText.textContent = 'Error';
+        };
         
         // Event listeners para controles
         document.querySelectorAll('[data-mode]').forEach(btn => {

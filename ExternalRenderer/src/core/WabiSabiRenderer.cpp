@@ -8,9 +8,11 @@
 #include <chrono>
 #include <filesystem>
 #include <cstdint>
+#include <cstdlib>
 #include "../cuda/WabiSabiKernels.cuh"
 #include "../cuda/CudaHelpers.h"
 #include "utils/CSVReader.h"
+#include "utils/Base64.h"
 
 // Para guardar PNG
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -559,8 +561,12 @@ void WabiSabiRenderer::RenderLoop() {
         SaveMapsToFiles();
         
         // Enviar a WebSocket si está conectado
-        if (wsConnected) {
+        if (config.enableWebViewer && wsConnected) {
+            auto ws_start = std::chrono::steady_clock::now();
             SendMapsToWebSocket();
+            auto ws_end = std::chrono::steady_clock::now();
+            // Opcional: imprimir tiempo de envío
+            // std::cout << "[WebSocket] Envío de mapas tomó: " << std::chrono::duration_cast<std::chrono::milliseconds>(ws_end - ws_start).count() << "ms" << std::endl;
         }
         
         auto frameEnd = std::chrono::steady_clock::now();
@@ -634,12 +640,121 @@ void WabiSabiRenderer::WatchJournal() {
 }
 
 void WabiSabiRenderer::StartWebSocketServer() {
-    // TODO: Implementar servidor WebSocket
-    std::cout << "[WebSocket] Servidor no implementado aún" << std::endl;
+    if (!config.enableWebViewer) return;
+
+    std::cout << "[WebSocket] Iniciando cliente..." << std::endl;
+    ws_client.init_asio();
+    ws_client.set_access_channels(websocketpp::log::alevel::none); // Desactivar logs
+
+    ws_client.set_open_handler([this](websocketpp::connection_hdl hdl) {
+        std::lock_guard<std::mutex> lock(ws_mutex);
+        ws_connection_hdl = hdl;
+        wsConnected = true;
+        std::cout << "[WebSocket] Conexión establecida." << std::endl;
+
+        // Identificarse como el renderer
+        Json::Value identify_msg;
+        identify_msg["type"] = "identify";
+        identify_msg["client"] = "renderer";
+        ws_client.send(hdl, identify_msg.toStyledString(), websocketpp::frame::opcode::text);
+    });
+
+    ws_client.set_close_handler([this](websocketpp::connection_hdl hdl) {
+        std::lock_guard<std::mutex> lock(ws_mutex);
+        wsConnected = false;
+        ws_connection_hdl.reset();
+        std::cout << "[WebSocket] Conexión cerrada." << std::endl;
+    });
+
+    ws_client.set_fail_handler([this](websocketpp::connection_hdl hdl) {
+        std::lock_guard<std::mutex> lock(ws_mutex);
+        wsConnected = false;
+        ws_connection_hdl.reset();
+        std::cerr << "[WebSocket] Falló la conexión." << std::endl;
+    });
+
+    ws_thread = std::thread([this]() {
+        while (isRunning) {
+            try {
+                if (!wsConnected) {
+                    std::cout << "[WebSocket] Intentando conectar a ws://localhost:" << config.webSocketPort << std::endl;
+                    websocketpp::lib::error_code ec;
+                    client::connection_ptr con = ws_client.get_connection("ws://localhost:" + std::to_string(config.webSocketPort), ec);
+                    if (ec) {
+                        std::cerr << "[WebSocket] Error al crear conexión: " << ec.message() << std::endl;
+                    } else {
+                        ws_client.connect(con);
+                        ws_client.run();
+                        ws_client.reset(); // Reset para poder reintentar
+                    }
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[WebSocket] Excepción: " << e.what() << std::endl;
+            }
+            // Esperar antes de reintentar
+            std::this_thread::sleep_for(std::chrono::seconds(5));
+        }
+    });
 }
 
 void WabiSabiRenderer::SendMapsToWebSocket() {
-    // TODO: Enviar mapas por WebSocket
+    std::lock_guard<std::mutex> lock(ws_mutex);
+    if (!wsConnected || ws_connection_hdl.expired()) return;
+
+    size_t pixelCount = config.width * config.height;
+    std::vector<unsigned char> png_buffer;
+    
+    // Función lambda para enviar un mapa
+    auto send_map = [&](const std::string& mapType, const unsigned char* data, int channels) {
+        int len;
+        unsigned char* png_data = stbi_write_png_to_mem(data, config.width * channels, config.width, config.height, channels, &len);
+        if (png_data) {
+            std::string base64_data = base64_encode(png_data, len);
+            
+            Json::Value msg;
+            msg["type"] = "texture_update";
+            msg["mapType"] = mapType;
+            msg["imageData"] = base64_data;
+
+            ws_client.send(ws_connection_hdl, msg.toStyledString(), websocketpp::frame::opcode::text);
+            free(png_data);
+        }
+    };
+    
+    // Preparar y enviar cada mapa
+    std::vector<float> h_buffer(pixelCount * 4);
+    std::vector<unsigned char> imageBuffer(pixelCount * 4);
+    
+    stbi_flip_vertically_on_write(1); // Importante para que coincida con el frontend
+
+    if (config.enableDepth) {
+        // Misma lógica de normalización que en SaveMapsToFiles
+        CUDA_CHECK(cudaMemcpy(h_buffer.data(), d_depthMap, pixelCount * sizeof(float), cudaMemcpyDeviceToHost));
+        for (size_t i = 0; i < pixelCount; i++) {
+            float distance = h_buffer[i];
+            unsigned char val = 255;
+            if (distance < config.maxDepth) {
+                val = static_cast<unsigned char>((1.0f - fmaxf(0.0f, fminf(1.0f, (distance - config.minDepth) / (config.maxDepth - config.minDepth)))) * 255.0f);
+            }
+            imageBuffer[i] = val;
+        }
+        send_map("depth", imageBuffer.data(), 1);
+    }
+    if (config.enableNormals) {
+        CUDA_CHECK(cudaMemcpy(h_buffer.data(), d_normalMap, pixelCount * sizeof(float3), cudaMemcpyDeviceToHost));
+        convertFloat3ToRGB(reinterpret_cast<const float3*>(h_buffer.data()), imageBuffer.data(), pixelCount);
+        send_map("normal", imageBuffer.data(), 3);
+    }
+    if (config.enableLines) {
+        CUDA_CHECK(cudaMemcpy(h_buffer.data(), d_linesMap, pixelCount * sizeof(float), cudaMemcpyDeviceToHost));
+        convertFloatToUchar(h_buffer.data(), imageBuffer.data(), pixelCount, false);
+        send_map("lines", imageBuffer.data(), 1);
+    }
+    if (config.enableSegmentation) {
+        CUDA_CHECK(cudaMemcpy(h_buffer.data(), d_segmentationMap, pixelCount * sizeof(float4), cudaMemcpyDeviceToHost));
+        convertFloat4ToRGBA(reinterpret_cast<const float4*>(h_buffer.data()), imageBuffer.data(), pixelCount);
+        send_map("segmentation", imageBuffer.data(), 4);
+    }
 }
 
 WabiSabiRenderer::CameraData WabiSabiRenderer::GetLatestCamera() {

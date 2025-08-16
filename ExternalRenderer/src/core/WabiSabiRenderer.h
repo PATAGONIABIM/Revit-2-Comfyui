@@ -1,4 +1,5 @@
 #pragma once
+
 #include <string>
 #include <memory>
 #include <thread>
@@ -9,6 +10,11 @@
 #include <cuda_runtime.h>
 #include <vector>
 #include <unordered_map> // <-- ¡SOLUCIÓN! Añadir esta línea
+#include <websocketpp/config/asio_no_tls_client.hpp>
+#include <websocketpp/client.hpp>
+#include <json/json.h>
+
+typedef websocketpp::client<websocketpp::config::asio_client> client;
 
 class WabiSabiRenderer {
 public:
@@ -65,8 +71,12 @@ private:
     RenderConfig config;
     std::atomic<bool> isRunning;
     std::thread renderThread;
+    client ws_client;
+    std::thread ws_thread;
+    websocketpp::connection_hdl ws_connection_hdl;
+    std::mutex ws_mutex;
     
-    std::thread journalWatcher;  
+    std::thread journalWatcher;
     std::atomic<bool> wsConnected{false};  
     
     // Camera state
