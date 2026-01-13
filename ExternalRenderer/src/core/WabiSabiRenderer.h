@@ -5,14 +5,18 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <condition_variable>      
 #include <chrono>
 #include <cuda_runtime.h>
+#include <future>
 #include <vector>
-#include <unordered_map> // <-- ¡SOLUCIÓN! Añadir esta línea
+#include <unordered_map>
 #include <websocketpp/config/asio_no_tls_client.hpp>
 #include <websocketpp/client.hpp>
 #include <json/json.h>
+
+#include "ImageMMFWriter.h" // <--- NUEVO INCLUDE
 
 typedef websocketpp::client<websocketpp::config::asio_client> client;
 
@@ -24,9 +28,10 @@ public:
         int height = 720;
         float minDepth = 0.1f;
         float maxDepth = 100.0f;
-        float depthThreshold = 0.03f; // Debe llamarse así
-        float normalThreshold = 0.4f; // Y este debe existir
+        float depthThreshold = 0.03f;
+        float normalThreshold = 0.4f;
         float cameraFov = 45.0f;
+        float gamma = 0.35f;
         std::string outputPath;
         std::string csvPath;
         bool enableSegmentation = true;
@@ -34,8 +39,12 @@ public:
         bool enableNormals = true;
         bool enableLines = true;
         bool enableWebViewer = false;
+        
+        bool enableDiskIO = false; // <--- NUEVO: Desactivar guardado en disco por defecto
+        bool enableMMF = true;     // <--- NUEVO: Activar MMF por defecto
+        
         int webSocketPort = 9001;
-        int maxFPS = 30;
+        int maxFPS = 60; // <--- AUMENTADO OJO
         int cudaDevice = 0;
         int blockSizeX = 16;
         int blockSizeY = 16;
@@ -46,11 +55,12 @@ public:
     };
 
     struct CameraData {
-    float3 eyePosition;
-    float3 lower_left_corner; // Esquina inferior izquierda del plano de visión
-    float3 horizontal_vec;    // Vector horizontal que abarca el plano de visión
-    float3 vertical_vec;      // Vector vertical que abarca el plano de visión
-    uint64_t timestamp;       // Mantener para la lógica de actualización
+        float3 eyePosition;
+        float3 lower_left_corner;
+        float3 horizontal_vec;
+        float3 vertical_vec;
+        uint64_t timestamp;
+        int64_t sequenceNumber; // <--- NUEVO
     };
 
     struct Statistics {
@@ -65,10 +75,31 @@ public:
     void Start();
     void Stop();
     void UpdateCamera(const CameraData& camera);
+    
+    void UpdateConfig(const RenderConfig& newConfig);
+
     Statistics GetStatistics() const;
 
 private:
+    struct HostFrameData {
+        std::vector<float> depth;
+        std::vector<float3> normals;
+        std::vector<float> lines;
+        std::vector<float4> segmentation;
+        int width, height;
+        int64_t sequenceNumber; // <--- NUEVO
+    };
+
+    // <--- NUEVO OBJETO MMF WRITER --->
+    std::unique_ptr<ImageMMFWriter> mmfWriter;
+
+    HostFrameData CopyGpuToHost(const RenderConfig& localConfig, int64_t seqNum);
+    void SaveToDiskInternal(const HostFrameData& data, const RenderConfig& localConfig);
+    void WriteToMMFInternal(const HostFrameData& data); // <--- NUEVO MÉTODO
+
     RenderConfig config;
+    mutable std::shared_mutex configMutex; 
+
     std::atomic<bool> isRunning;
     std::thread renderThread;
     client ws_client;
@@ -79,56 +110,51 @@ private:
     std::thread journalWatcher;
     std::atomic<bool> wsConnected{false};  
     
-    // Camera state
     CameraData currentCamera;  
     std::mutex cameraMutex;
     std::condition_variable cameraCv;
     bool cameraInitialized = false;    
     
-    // Memory mapped files
     void* geometryMMF;
     
-    // GPU buffers
-    float* d_vertices;
-    int* d_triangles;
-    float* d_normals;
-    int* d_elementIds;
-    int* d_categoryIds;
+    float* d_vertices = nullptr;
+    int* d_triangles = nullptr;
+    float* d_normals = nullptr;
+    int* d_elementIds = nullptr;
+    int* d_categoryIds = nullptr;
     
-    // Output buffers
-    float* d_depthMap;
-    float* d_normalMap;
-    float* d_linesMap;
-    float* d_segmentationMap;
+    float* d_depthMap = nullptr;
+    float* d_normalMap = nullptr;
+    float* d_linesMap = nullptr;
+    float* d_segmentationMap = nullptr;
+    int* d_elementIdPixelMap = nullptr;
     
-    // Información de geometría
     int vertexCount = 0;
     int triangleCount = 0; 
     int categoryCount = 0;
     
-    // Colores de categorías
     float3* d_categoryColors = nullptr;
     std::vector<float3> h_categoryColors;
 
-    // Statistics
     std::atomic<uint64_t> totalFrames;
     std::atomic<float> currentFPS;
     std::atomic<float> avgFrameTime;
 
-    std::string lastKnownTimestamp; // Para guardar la última marca de tiempo leída
-    void CheckForUpdates();         // Nuevo método para verificar si hay cambios
+    std::string lastKnownTimestamp;
+    void CheckForUpdates();
     void ReloadGeometry();  
     
     void RenderLoop();
     void OpenGeometryMMF();
-    void RenderAllMaps(const CameraData& camera);
-    void SaveMapsToFiles();
+    
+    void RenderAllMaps(const CameraData& camera, const RenderConfig& currentConfig, cudaStream_t stream);
+    
     std::string FindLatestWabiSabiMMF();
     void ReadGeometryHeader();
     void LoadColorMappingCSV();
     void WatchJournal();           
     void StartWebSocketServer();   
-    void SendMapsToWebSocket();    
+    void SendMapsToWebSocket(const RenderConfig& currentConfig); 
     CameraData GetLatestCamera();
 
     std::unordered_map<int, std::string> categoryIndexToNameMap;

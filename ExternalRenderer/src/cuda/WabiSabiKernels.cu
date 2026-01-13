@@ -1,351 +1,259 @@
 #include "WabiSabiKernels.cuh"
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <float.h>  // Para FLT_MAX
+#include <float.h>
 
-#define MAX_CATEGORIES 256
+// ======================================================================================
+// OPERADORES MATEMÁTICOS PARA float3 (CORREGIDOS PARA EVITAR ERRORES DE COMPILACIÓN)
+// ======================================================================================
 
-// Funciones helper para operaciones con float3
-__device__ float3 operator-(const float3& a, const float3& b) {
-    return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
+__device__ inline float3 operator-(const float3& a, const float3& b) { 
+    return make_float3(a.x - b.x, a.y - b.y, a.z - b.z); 
 }
 
-__device__ float3 operator*(float s, const float3& v) {
-    return make_float3(s * v.x, s * v.y, s * v.z);
+__device__ inline float3 operator+(const float3& a, const float3& b) { 
+    return make_float3(a.x + b.x, a.y + b.y, a.z + b.z); 
 }
 
-__device__ float3 operator+(const float3& a, const float3& b) {
-    return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
+// Escalar * Vector
+__device__ inline float3 operator*(float s, const float3& v) { 
+    return make_float3(s * v.x, s * v.y, s * v.z); 
 }
 
-__device__ float dot(const float3& a, const float3& b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
+// Vector * Escalar (Esto resuelve tu error de compilación previo)
+__device__ inline float3 operator*(const float3& v, float s) { 
+    return make_float3(v.x * s, v.y * s, v.z * s); 
 }
 
-__device__ float3 cross(const float3& a, const float3& b) {
+// División de Vector por Escalar
+__device__ inline float3 operator/(const float3& v, float s) { 
+    float inv = 1.0f / s;
+    return v * inv; 
+}
+
+__device__ inline float dot(const float3& a, const float3& b) { 
+    return a.x * b.x + a.y * b.y + a.z * b.z; 
+}
+
+__device__ inline float3 cross(const float3& a, const float3& b) { 
     return make_float3(
         a.y * b.z - a.z * b.y,
         a.z * b.x - a.x * b.z,
         a.x * b.y - a.y * b.x
-    );
+    ); 
 }
 
-__device__ float3 normalize(const float3& v) {
-    float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (len > 0) {
-        float invLen = 1.0f / len;
-        return make_float3(v.x * invLen, v.y * invLen, v.z * invLen);
+__device__ inline float3 normalize(const float3& v) { 
+    float len = sqrtf(dot(v, v));
+    if (len > 0.000001f) {
+        return v / len;
     }
     return v;
 }
 
-// Implementación del algoritmo de Möller-Trumbore para intersección rayo-triángulo
+// ======================================================================================
+// INTERSECCIÓN RAYO-TRIÁNGULO (Möller-Trumbore)
+// ======================================================================================
+
 __device__ float rayTriangleIntersect(
-    const float3& origin,
-    const float3& direction,
-    const float3& v0,
-    const float3& v1,
-    const float3& v2)
+    const float3& orig, const float3& dir, 
+    const float3& v0, const float3& v1, const float3& v2) 
 {
     const float EPSILON = 0.0000001f;
     float3 edge1 = v1 - v0;
     float3 edge2 = v2 - v0;
-    float3 h = cross(direction, edge2);
+    float3 h = cross(dir, edge2);
     float a = dot(edge1, h);
     
-    if (a > -EPSILON && a < EPSILON)
-        return -1.0f;
+    if (a > -EPSILON && a < EPSILON) return -1.0f;
     
     float f = 1.0f / a;
-    float3 s = origin - v0;
+    float3 s = orig - v0;
     float u = f * dot(s, h);
     
-    if (u < 0.0f || u > 1.0f)
-        return -1.0f;
+    if (u < 0.0f || u > 1.0f) return -1.0f;
     
     float3 q = cross(s, edge1);
-    float v = f * dot(direction, q);
+    float v = f * dot(dir, q);
     
-    if (v < 0.0f || u + v > 1.0f)
-        return -1.0f;
+    if (v < 0.0f || u + v > 1.0f) return -1.0f;
     
     float t = f * dot(edge2, q);
-    
-    if (t > EPSILON)
-        return t;
-    else
-        return -1.0f;
+    return (t > EPSILON) ? t : -1.0f;
 }
 
-// Kernel para renderizar mapa de profundidad
-__global__ void RenderDepthMap(
-    const float3* vertices, int vertexCount, const int* triangles, int triangleCount,
-    const CameraData camera, const RenderConfig config, float* depthMap)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= config.width || y >= config.height) return;
+// ======================================================================================
+// MEGA-KERNEL: RenderAllMapsCombined
+// Procesa Depth, Normals, IDs y Segmentation en una sola pasada de triángulos.
+// ======================================================================================
 
-    float u = (float)x / (config.width - 1);
-    float v = (float)y / (config.height - 1);
-
-    float3 rayOrigin = camera.eyePosition;
-    float3 rayDir = normalize(camera.lower_left_corner
-                             + u * camera.horizontal_vec
-                             + v * camera.vertical_vec
-                             - rayOrigin);
-
-    float closestT = FLT_MAX;
-
-    for (int i = 0; i < triangleCount; i++) {
-        int i0 = triangles[i * 3]; int i1 = triangles[i * 3 + 1]; int i2 = triangles[i * 3 + 2];
-        if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) continue;
-        
-        float3 v0 = vertices[i0]; float3 v1 = vertices[i1]; float3 v2 = vertices[i2];
-        
-        float t = rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2);
-        if (t > 0.0f && t < closestT) {
-            closestT = t;
-        }
-    }
-
-    // --- LÓGICA DE PROFUNDIDAD SIMPLIFICADA ---
-    // Simplemente escribimos la distancia real. Si no hay hit, se queda como FLT_MAX.
-    // La normalización ahora es responsabilidad del código C++.
-    depthMap[y * config.width + x] = closestT;
-}
-// Kernel para renderizar mapa de normales
-__global__ void RenderNormalMap(
-    const float3* vertices, int vertexCount, const int* triangles, const float3* normals, int triangleCount,
-    const CameraData camera, const RenderConfig config, float3* normalMap)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= config.width || y >= config.height) return;
-    
-    float u = (float)x / (config.width - 1);
-    // --- INICIO DE LA CORRECCIÓN ---
-    // Se elimina la inversión de 'v' para que coincida con el kernel de profundidad.
-    // La imagen se generará de abajo hacia arriba, lo cual es esperado por la
-    // función de guardado que usa stbi_flip_vertically_on_write(1).
-    float v = (float)y / (config.height - 1); 
-    // --- FIN DE LA CORRECCIÓN ---
-
-    float3 rayOrigin = camera.eyePosition;
-    
-    float3 rayDir = normalize(camera.lower_left_corner 
-                             + u * camera.horizontal_vec 
-                             + v * camera.vertical_vec 
-                             - rayOrigin);
-
-    float closestT = FLT_MAX;
-    int hitTriangle = -1;
-    
-
-    for (int i = 0; i < triangleCount; i++) {
-        int i0 = triangles[i * 3]; int i1 = triangles[i * 3 + 1]; int i2 = triangles[i * 3 + 2];
-        if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) continue;
-        float3 v0 = vertices[i0]; float3 v1 = vertices[i1]; float3 v2 = vertices[i2];
-        float t = rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2);
-        if (t > 0.0f && t < closestT) { closestT = t; hitTriangle = i; }
-    }
-
-    float3 normal = make_float3(0.5f, 0.5f, 1.0f);
-    if (hitTriangle >= 0) {
-        int i0 = triangles[hitTriangle * 3];
-        // Aquí también validamos por si acaso, aunque ya debería estar cubierto
-        if (i0 < vertexCount) {
-             normal = normalize(normals[i0]);
-        }
-    }
-    normalMap[y * config.width + x] = normal;
-}
-
-// --------------------------------------------------------------------------------------
-// Kernel de Detección de Bordes por Normales
-// Entrada: Mapa de Normales
-// Salida:  Mapa de Líneas
-// --------------------------------------------------------------------------------------
-__global__ void AdvancedNormalEdgeKernel(
-    const float3* normalMap,
-    float* linesMap,
-    int width, int height,
-    float normalThreshold)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x == 0 || x >= width - 1 || y == 0 || y >= height - 1) {
-        if (x < width && y < height) {
-            linesMap[y * width + x] = 1.0f; // Fondo blanco
-        }
-        return;
-    }
-
-    // Muestreo de las normales de los 8 píxeles vecinos
-    const float3 n00 = normalMap[(y - 1) * width + (x - 1)]; const float3 n01 = normalMap[(y - 1) * width + x]; const float3 n02 = normalMap[(y - 1) * width + (x + 1)];
-    const float3 n10 = normalMap[y * width + (x - 1)];       const float3 n11 = normalMap[y * width + x];       const float3 n12 = normalMap[y * width + (x + 1)];
-    const float3 n20 = normalMap[(y + 1) * width + (x - 1)]; const float3 n21 = normalMap[(y + 1) * width + x]; const float3 n22 = normalMap[(y + 1) * width + (x + 1)];
-
-    // Si el píxel central es fondo, no hay línea que dibujar
-    if (n11.x == 0.5f && n11.y == 0.5f && n11.z == 1.0f) {
-        linesMap[y * width + x] = 1.0f;
-        return;
-    }
-
-    // Aplicar Sobel para el eje X
-    float3 gx = (n02 + 2.0f * n12 + n22) - (n00 + 2.0f * n10 + n20);
-
-    // Aplicar Sobel para el eje Y
-    float3 gy = (n20 + 2.0f * n21 + n22) - (n00 + 2.0f * n01 + n02);
-
-    // --- LÍNEA CORREGIDA ---
-    // Calcular la magnitud del gradiente (cambio de ángulo) usando la fórmula correcta
-    float gx_mag = sqrtf(gx.x * gx.x + gx.y * gx.y + gx.z * gx.z);
-    float gy_mag = sqrtf(gy.x * gy.x + gy.y * gy.y + gy.z * gy.z);
-    float magnitude = gx_mag + gy_mag;
-
-    // Si la magnitud supera el umbral, es una línea (negra)
-    if (magnitude > normalThreshold) {
-        linesMap[y * width + x] = 0.0f;
-    } else {
-        linesMap[y * width + x] = 1.0f;
-    }
-}
-
-// Kernel para renderizar mapa de líneas (detección de bordes)
-__global__ void SobelFilterKernel(const float* depthMap, float* linesMap, int width, int height, float threshold)
-{
-    int x = blockIdx.x * blockDim.x + threadIdx.x;
-    int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-    if (x == 0 || x >= width - 1 || y == 0 || y >= height - 1) {
-        if (x < width && y < height) {
-            linesMap[y * width + x] = 1.0f; // Fondo blanco en los bordes de la imagen
-        }
-        return;
-    }
-
-    // Muestreo de píxeles vecinos del mapa de profundidad
-    float p00 = depthMap[(y-1) * width + (x-1)]; float p01 = depthMap[(y-1) * width + x]; float p02 = depthMap[(y-1) * width + (x+1)];
-    float p10 = depthMap[y * width + (x-1)];                                             float p12 = depthMap[y * width + (x+1)];
-    float p20 = depthMap[(y+1) * width + (x-1)]; float p21 = depthMap[(y+1) * width + x]; float p22 = depthMap[(y+1) * width + (x+1)];
-
-    // Operadores de Sobel para detectar cambios en la profundidad
-    float gx = (p02 + 2.0f * p12 + p22) - (p00 + 2.0f * p10 + p20);
-    float gy = (p20 + 2.0f * p21 + p22) - (p00 + 2.0f * p01 + p02);
-
-    float magnitude = sqrtf(gx * gx + gy * gy);
-
-    // Si el cambio de profundidad es grande (un borde), pinta negro (0.0). Si no, pinta blanco (1.0).
-    linesMap[y * width + x] = (magnitude > threshold) ? 0.0f : 1.0f;
-}
-
-
-// --------------------------------------------------------------------------------------
-// Kernel de Líneas (SIMPLIFICADO)
-// ¡Este kernel ya no existe! Su lógica se mueve a la función de lanzamiento.
-// Lo mantenemos vacío por si alguna referencia antigua lo necesita, pero no se usa.
-// --------------------------------------------------------------------------------------
-__global__ void RenderLinesMap() { }
-// Kernel para renderizar mapa de segmentación
-__global__ void RenderSegmentationMap(
-    const float3* vertices, int vertexCount, const int* triangles, const int* categoryIds,
+__global__ void RenderAllMapsCombinedKernel(
+    const float3* vertices, int vertexCount, const int* triangles, 
+    const float3* normals, const int* elementIds, const int* categoryIds,
     const float3* categoryColors, int triangleCount, int categoryCount,
-    const CameraData camera, const RenderConfig config, float4* segmentationMap)
+    const CameraData camera, const RenderConfig config,
+    float* depthMap, float3* normalMap, int* idPixelMap, float4* segmentationMap)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
+
     if (x >= config.width || y >= config.height) return;
 
+    // Generación del rayo
     float u = (float)x / (config.width - 1);
     float v = (float)y / (config.height - 1);
-
     float3 rayOrigin = camera.eyePosition;
-    float3 rayDir = normalize(camera.lower_left_corner
-                             + u * camera.horizontal_vec
-                             + v * camera.vertical_vec
-                             - rayOrigin);
+    float3 target = camera.lower_left_corner + (u * camera.horizontal_vec) + (v * camera.vertical_vec);
+    float3 rayDir = normalize(target - rayOrigin);
 
     float closestT = FLT_MAX;
-    int hitCategoryId = -1;
+    int hitTriangleIdx = -1;
 
-    // Bucle sobre TODOS los triángulos.
+    // --- BUCLE ÚNICO DE TRIÁNGULOS ---
     for (int i = 0; i < triangleCount; i++) {
-        int i0 = triangles[i * 3]; int i1 = triangles[i * 3 + 1]; int i2 = triangles[i * 3 + 2];
-        if (i0 >= vertexCount || i1 >= vertexCount || i2 >= vertexCount) continue;
+        int i0 = triangles[i * 3];
+        int i1 = triangles[i * 3 + 1];
+        int i2 = triangles[i * 3 + 2];
         
-        float3 v0 = vertices[i0]; float3 v1 = vertices[i1]; float3 v2 = vertices[i2];
-        
-        float t = rayTriangleIntersect(rayOrigin, rayDir, v0, v1, v2);
+        // Validación de seguridad para memoria CUDA
+        if (i0 >= vertexCount || i0 < 0) continue;
+
+        float t = rayTriangleIntersect(rayOrigin, rayDir, vertices[i0], vertices[i1], vertices[i2]);
         if (t > 0.0f && t < closestT) {
             closestT = t;
-            hitCategoryId = categoryIds[i0];
+            hitTriangleIdx = i;
         }
     }
 
-    // Color de fondo por defecto: GRIS CLARO, OPACA.
-    float4 finalColor = make_float4(0.8f, 0.8f, 0.8f, 1.0f);
+    int pixelIdx = y * config.width + x;
 
-    // Si el rayo golpeó un objeto y la categoría es válida...
-    if (hitCategoryId != -1 && hitCategoryId >= 0 && hitCategoryId < categoryCount) {
-        // ...obtenemos el color correcto.
-        float3 catColor = categoryColors[hitCategoryId];
-        finalColor = make_float4(catColor.x, catColor.y, catColor.z, 1.0f);
+    if (hitTriangleIdx >= 0) {
+        int firstVertexIdx = triangles[hitTriangleIdx * 3];
+        
+        // 1. Mapa de Profundidad
+        depthMap[pixelIdx] = closestT;
+        
+        // 2. Mapa de Normales
+        normalMap[pixelIdx] = normalize(normals[firstVertexIdx]);
+        
+        // 3. Mapa de IDs (para las líneas de Revit)
+        idPixelMap[pixelIdx] = elementIds[firstVertexIdx];
+        
+        // 4. Mapa de Segmentación
+        int catId = categoryIds[firstVertexIdx];
+        if (catId >= 0 && catId < 256) {
+            float3 c = categoryColors[catId];
+            segmentationMap[pixelIdx] = make_float4(c.x, c.y, c.z, 1.0f);
+        } else {
+            segmentationMap[pixelIdx] = make_float4(0.5f, 0.5f, 0.5f, 1.0f);
+        }
+    } else {
+        // Valores por defecto (Fondo)
+        depthMap[pixelIdx] = FLT_MAX;
+        normalMap[pixelIdx] = make_float3(0.5f, 0.5f, 1.0f);
+        idPixelMap[pixelIdx] = -1;
+        segmentationMap[pixelIdx] = make_float4(0.1f, 0.1f, 0.1f, 1.0f);
+    }
+}
+
+// ======================================================================================
+// KERNEL: CombinedEdgeDetection (Post-procesado de líneas)
+// ======================================================================================
+
+__global__ void CombinedEdgeDetectionKernel(
+    const float3* normalMap, 
+    const float* depthMap, 
+    const int* idMap, 
+    float* linesMap, 
+    int w, int h, 
+    float normalThresh, // <--- Este ahora sí se usa
+    float depthThresh)   // <--- Este ahora sí se usa
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    // Margen de 1 píxel para poder comparar con vecinos
+    if (x < 1 || x >= w - 1 || y < 1 || y >= h - 1) return;
+
+    int idxC = y * w + x;
+    int idC = idMap[idxC];
+    float dC = depthMap[idxC];
+    float3 nC = normalMap[idxC];
+
+    // Si es fondo o está demasiado lejos, pintar blanco
+    if (idC == -1 || dC > 10000.0f) {
+        linesMap[idxC] = 1.0f;
+        return;
     }
 
-    segmentationMap[y * config.width + x] = finalColor;
+    // Índices de vecinos (Izquierda y Arriba)
+    int idxL = y * w + (x - 1);
+    int idxU = (y + 1) * w + x;
+
+    // --- 1. DETECCIÓN POR ID (Bordes de familia/objeto) ---
+    bool isIdEdge = (idC != idMap[idxL] || idC != idMap[idxU]);
+
+    // --- 2. DETECCIÓN POR PROFUNDIDAD (Bordes de silueta) ---
+    // Calculamos la diferencia relativa de profundidad
+    float diffDL = fabsf(dC - depthMap[idxL]) / dC;
+    float diffDU = fabsf(dC - depthMap[idxU]) / dC;
+    bool isDepthEdge = (diffDL > depthThresh || diffDU > depthThresh);
+
+    // --- 3. DETECCIÓN POR NORMALES (Aristas y pliegues internos) ---
+    // Calculamos el producto punto (1.0 = misma dirección, 0.0 = perpendicular)
+    float dotL = dot(nC, normalMap[idxL]);
+    float dotU = dot(nC, normalMap[idxU]);
+    // Si la diferencia (1.0 - dot) supera el umbral, es un borde
+    bool isNormalEdge = ((1.0f - dotL) > normalThresh || (1.0f - dotU) > normalThresh);
+
+    // RESULTADO: Si cumple CUALQUIERA de las tres condiciones, dibujamos negro (0.0)
+    if (isIdEdge || isDepthEdge || isNormalEdge) {
+        linesMap[idxC] = 0.0f;
+    } else {
+        linesMap[idxC] = 1.0f;
+    }
 }
 
+// ======================================================================================
+// WRAPPERS (Llamados desde C++)
+// ======================================================================================
 
-// Implementación de las funciones de lanzamiento
-void LaunchDepthKernel(
-    const float3* d_vertices, int vertexCount, const int* d_triangles, int triangleCount,
-    const CameraData& camera, const RenderConfig& config, float* d_depthMap, cudaStream_t stream)
+void LaunchAllMapsKernel(
+    const float3* d_vertices, int vertexCount, const int* d_triangles, 
+    const float3* d_normals, const int* d_elementIds, const int* d_categoryIds,
+    const float3* d_categoryColors, int triangleCount, int categoryCount,
+    const CameraData& camera, const RenderConfig& config,
+    float* d_depth, float3* d_normal, int* d_idPixel, float4* d_segment, 
+    cudaStream_t stream) 
 {
     dim3 blockSize(16, 16);
-    dim3 gridSize((config.width + blockSize.x - 1) / blockSize.x, (config.height + blockSize.y - 1) / blockSize.y);
-    RenderDepthMap<<<gridSize, blockSize, 0, stream>>>(d_vertices, vertexCount, d_triangles, triangleCount, camera, config, d_depthMap);
-}
-
-void LaunchNormalKernel(
-    const float3* d_vertices, int vertexCount, const int* d_triangles, const float3* d_normals, int triangleCount,
-    const CameraData& camera, const RenderConfig& config, float3* d_normalMap, cudaStream_t stream)
-{
-    dim3 blockSize(16, 16);
-    dim3 gridSize((config.width + blockSize.x - 1) / blockSize.x, (config.height + blockSize.y - 1) / blockSize.y);
-    RenderNormalMap<<<gridSize, blockSize, 0, stream>>>(d_vertices, vertexCount, d_triangles, d_normals, triangleCount, camera, config, d_normalMap);
+    dim3 gridSize((config.width + 15) / 16, (config.height + 15) / 16);
+    
+    RenderAllMapsCombinedKernel<<<gridSize, blockSize, 0, stream>>>(
+        d_vertices, vertexCount, d_triangles, d_normals, d_elementIds, d_categoryIds,
+        d_categoryColors, triangleCount, categoryCount, camera, config, 
+        d_depth, d_normal, d_idPixel, d_segment);
 }
 
 void LaunchLinesKernel(
-    const float3* d_normalMap,
-    const RenderConfig& config,
-    float* d_linesMap,
-    cudaStream_t stream)
+    const float3* d_normalMap, 
+    const float* d_depthMap, 
+    const int* d_idPixelMap,
+    const RenderConfig& config, // <--- Aquí vienen los valores del JSON
+    float* d_linesMap, 
+    cudaStream_t stream) 
 {
     dim3 blockSize(16, 16);
-    dim3 gridSize((config.width + blockSize.x - 1) / blockSize.x, (config.height + blockSize.y - 1) / blockSize.y);
-
-    AdvancedNormalEdgeKernel<<<gridSize, blockSize, 0, stream>>>(
-        d_normalMap,
-        d_linesMap,
-        config.width, config.height,
-        config.normalThreshold
-    );
-}
-
-void LaunchSegmentationKernel(
-    const float3* d_vertices, int vertexCount, const int* d_triangles, const int* d_categoryIds, // <-- AÑADIR d_categoryIds
-    const float3* d_categoryColors, int triangleCount, int categoryCount, // <-- AÑADIR categoryCount
-    const CameraData& camera, const RenderConfig& config, float4* d_segmentationMap, cudaStream_t stream)
-{
-    dim3 blockSize(16, 16);
-    dim3 gridSize((config.width + blockSize.x - 1) / blockSize.x, (config.height + blockSize.y - 1) / blockSize.y);
+    dim3 gridSize((config.width + 15) / 16, (config.height + 15) / 16);
     
-    // --- INICIO DE LA CORRECCIÓN: PASAR LOS NUEVOS PARÁMETROS ---
-    RenderSegmentationMap<<<gridSize, blockSize, 0, stream>>>(
-        d_vertices, vertexCount, d_triangles, d_categoryIds, d_categoryColors,
-        triangleCount, categoryCount, 
-        camera, config, d_segmentationMap);
-    // --- FIN DE LA CORRECCIÓN ---
+    CombinedEdgeDetectionKernel<<<gridSize, blockSize, 0, stream>>>(
+        d_normalMap, 
+        d_depthMap, 
+        d_idPixelMap, 
+        d_linesMap, 
+        config.width, 
+        config.height, 
+        config.normalThreshold, // <--- Valor del JSON pasado al kernel
+        config.depthThreshold   // <--- Valor del JSON pasado al kernel
+    );
 }

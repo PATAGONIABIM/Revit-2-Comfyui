@@ -2,6 +2,8 @@
 **/bin
 **/obj
 **/.vs
+**/build
+**/.vscode
 
 # Excluir documentación y propiedades
 

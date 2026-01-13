@@ -1,0 +1,324 @@
+# Plan de Desarrollo Optimizado: WabiSabi Bridge - Nodos de ComfyUI
+
+## Resumen del Proyecto: WabiSabi Bridge - Nodos Personalizados para ComfyUI (Versión Optimizada)
+
+El objetivo de este proyecto es desarrollar un conjunto avanzado de nodos personalizados para ComfyUI que establezcan una conexión de alto rendimiento y baja latencia con Autodesk Revit. Estos nodos no solo vigilarán cambios en archivos locales, sino que implementarán múltiples canales de comunicación (named pipes, memoria compartida) para transferencia de datos en tiempo real.
+
+La arquitectura optimizada incluirá un sistema de caché inteligente para evitar reprocesar datos idénticos, soporte para nuevos tipos de datos como normal maps y metadatos estructurados del BIM, y un sistema de preview en vivo que mostrará los cambios antes de ejecutar el workflow completo. Los nodos serán capaces de manejar tanto el modo de retrocompatibilidad con archivos como los nuevos modos de comunicación directa, detectando automáticamente el mejor método disponible.
+
+El sistema implementará técnicas avanzadas como lazy loading, procesamiento diferencial, y notificaciones granulares que permitirán actualizaciones parciales del workflow, mejorando drásticamente la eficiencia y la experiencia del usuario en flujos de trabajo iterativos de visualización arquitectónica.
+
+## Plan de Desarrollo: Nodos Personalizados de ComfyUI Optimizados
+
+### Tecnologías y Prerrequisitos:
+
+- **Lenguaje**: Python 3.12+
+- **Entorno**: ComfyUI con soporte para nodos personalizados
+- **Librerías Clave**:
+  - `watchdog`: Vigilancia de archivos (modo retrocompatibilidad)
+  - `pywin32` o `posix_ipc`: Named pipes y memoria compartida
+  - `Pillow` + `pillow-simd`: Procesamiento de imágenes optimizado
+  - `numpy`: Arrays eficientes
+  - `torch`: Tensores y GPU
+  - `msgpack`: Deserialización binaria rápida
+  - `aiocache`: Caché asíncrono
+  - `opencv-python`: Procesamiento avanzado de imágenes
+
+---
+
+## Fase 0: Arquitectura Base y Sistema de Comunicación
+
+### Módulo 0.1: Estructura del Proyecto y Core
+**Tarea 0.1.1**: Crear estructura modular optimizada:
+```
+ComfyUI_WabiSabi_Bridge/
+├── __init__.py
+├── core/
+│   ├── communication/
+│   │   ├── base.py         # Interfaz abstracta
+│   │   ├── file_channel.py # Retrocompatibilidad
+│   │   ├── pipe_channel.py # Named pipes
+│   │   └── shm_channel.py  # Memoria compartida
+│   ├── cache/
+│   │   ├── manager.py      # Gestor de caché
+│   │   └── storage.py      # Backends de almacenamiento
+│   └── utils/
+├── nodes/
+├── ui/
+└── tests/
+```
+
+**Tarea 0.1.2**: Implementar **sistema de plugins** para canales de comunicación
+
+**Tarea 0.1.3**: Crear **gestor de configuración** con detección automática de capacidades
+
+### Módulo 0.2: Capa de Comunicación Unificada
+**Tarea 0.2.1**: Desarrollar clase abstracta `CommunicationChannel`:
+```python
+class CommunicationChannel(ABC):
+    @abstractmethod
+    async def connect(self) -> bool
+    @abstractmethod
+    async def read_data(self) -> Dict[str, Any]
+    @abstractmethod
+    def subscribe(self, callback: Callable)
+    @abstractmethod
+    def get_latency(self) -> float
+```
+
+**Tarea 0.2.2**: Implementar **auto-discovery** de servidor Revit
+
+**Tarea 0.2.3**: Sistema de **reconexión automática** con backoff exponencial
+
+---
+
+## Fase 1: Sistema de Caché y Optimización de Datos
+
+### Módulo 1.1: Gestor de Caché Inteligente
+**Tarea 1.1.1**: Implementar `CacheManager` con múltiples niveles:
+```python
+class CacheManager:
+    - L1: LRU en memoria (últimos 10 frames)
+    - L2: Disco con índice SQLite
+    - Hashing perceptual para imágenes
+    - Diff binario para detectar cambios mínimos
+```
+
+**Tarea 1.1.2**: **Caché predictivo** que pre-carga datos anticipando movimientos
+
+**Tarea 1.1.3**: Sistema de **invalidación parcial** por región de imagen
+
+### Módulo 1.2: Procesamiento Diferencial
+**Tarea 1.2.1**: Implementar comparación de frames para detectar regiones cambiadas
+
+**Tarea 1.2.2**: **Actualización parcial de tensores** sin recrear todo
+
+**Tarea 1.2.3**: Sistema de **máscaras de cambio** para workflows condicionales
+
+---
+
+## Fase 2: Nodos Base Optimizados
+
+### Módulo 2.1: Nodo Base Abstracto
+**Tarea 2.1.1**: Crear `WabiSabiBaseNode` con funcionalidad común:
+```python
+class WabiSabiBaseNode:
+    - Gestión automática de conexiones
+    - Sistema de suscripción a eventos
+    - Manejo de errores robusto
+    - Métricas de rendimiento integradas
+    - Soporte para múltiples canales de comunicación
+```
+
+**Tarea 2.1.2**: Implementar **lazy loading** de datos
+
+**Tarea 2.1.3**: Sistema de **notificaciones granulares** (por canal, por tipo de dato)
+
+### Módulo 2.2: Sistema de Preview en Vivo
+**Tarea 2.2.1**: Crear widget de preview integrado en la UI de ComfyUI
+
+**Tarea 2.2.2**: **Streaming de miniaturas** en baja resolución
+
+**Tarea 2.2.3**: Indicadores visuales de estado de conexión y actividad
+
+---
+
+## Fase 3: Nodos de Imagen Avanzados
+
+### Módulo 3.1: WatchImagePro Node
+**Tarea 3.1.1**: Evolución del nodo básico con características avanzadas:
+```python
+NODE_NAME = "Watch Image Pro"
+INPUT_TYPES:
+    - source: ["file", "pipe", "memory", "auto"]
+    - path_or_id: string
+    - channel: ["RGB", "ALPHA", "DEPTH16", "NORMAL"]
+    - resolution: ["native", "half", "quarter", "custom"]
+    - cache_mode: ["aggressive", "normal", "disabled"]
+RETURN_TYPES: ("IMAGE", "MASK", "METADATA")
+```
+
+**Tarea 3.1.2**: Soporte para **formatos avanzados**:
+- EXR para depth maps de 16/32 bit
+- DDS para normal maps comprimidos
+- WebP para mejor compresión
+
+**Tarea 3.1.3**: **Conversión GPU-accelerated** de formatos
+
+### Módulo 3.2: Nodo de Procesamiento Batch
+**Tarea 3.2.1**: Crear `BatchImageProcessor`:
+```python
+NODE_NAME = "Batch Image Processor"
+- Procesar múltiples imágenes en paralelo
+- Aplicar transformaciones consistentes
+- Generar secuencias animadas
+```
+
+**Tarea 3.2.2**: Pipeline de procesamiento con **SIMD optimizations**
+
+### Módulo 3.3: Nodo de Segmentación Inteligente
+**Tarea 3.3.1**: Desarrollar `SmartSegmentationNode`:
+```python
+NODE_NAME = "Smart Segmentation"
+INPUT_TYPES:
+    - segmentation_map: IMAGE
+    - element_ids: IMAGE (opcional)
+    - filter_by: ["category", "material", "custom_param"]
+RETURN_TYPES: ("IMAGE", "MASKS_LIST", "LABELS")
+```
+
+**Tarea 3.3.2**: **Extracción automática de máscaras** por categoría
+
+**Tarea 3.3.3**: Generación de **prompts contextuales** basados en elementos
+
+---
+
+## Fase 4: Nodos de Datos y Metadatos
+
+### Módulo 4.1: Nodo de Metadatos Estructurados
+**Tarea 4.1.1**: Crear `WatchMetadataNode`:
+```python
+NODE_NAME = "Watch Metadata"
+INPUT_TYPES:
+    - source: ["file", "pipe", "memory", "auto"]
+    - data_type: ["materials", "lighting", "camera", "all"]
+RETURN_TYPES: ("METADATA_DICT", "STRING", "JSON")
+```
+
+**Tarea 4.1.2**: Parser inteligente de JSON/MessagePack
+
+**Tarea 4.1.3**: **Generación dinámica de prompts** basada en contexto
+
+### Módulo 4.2: Nodo de Control de Iluminación
+**Tarea 4.2.1**: Desarrollar `LightingControlNode`:
+```python
+NODE_NAME = "BIM Lighting Control"
+- Extraer información de iluminación del BIM
+- Generar mapas de iluminación para ControlNet
+- Sincronizar hora del día y posición solar
+```
+
+### Módulo 4.3: Nodo de Materiales PBR
+**Tarea 4.3.1**: Implementar `PBRMaterialNode`:
+```python
+NODE_NAME = "PBR Material Mapper"
+- Mapear materiales de Revit a descripciones PBR
+- Generar prompts de materiales detallados
+- Crear máscaras por tipo de material
+```
+
+---
+
+## Fase 5: Sistema de Control Bidireccional
+
+### Módulo 5.1: Nodos de Comando
+**Tarea 5.1.1**: Crear `SendCommandNode`:
+```python
+NODE_NAME = "Send to Revit"
+INPUT_TYPES:
+    - command: ["change_view", "update_material", "toggle_element"]
+    - parameters: JSON
+RETURN_TYPES: ("SUCCESS", "RESPONSE")
+```
+
+**Tarea 5.1.2**: Protocolo de comandos seguros con validación
+
+### Módulo 5.2: Sincronización de Cámara
+**Tarea 5.2.1**: Desarrollar `CameraSyncNode`:
+```python
+NODE_NAME = "Camera Sync"
+- Sincronización bidireccional de cámara
+- Interpolación suave de movimientos
+- Presets de vistas guardadas
+```
+
+---
+
+## Fase 6: Optimizaciones de Rendimiento y UX
+
+### Módulo 6.1: Motor de Ejecución Optimizado
+**Tarea 6.1.1**: Implementar **ejecución diferencial**:
+- Solo ejecutar nodos afectados por cambios
+- Sistema de dependencias inteligente
+- Paralelización de nodos independientes
+
+**Tarea 6.1.2**: **Pooling de recursos** (tensores, buffers)
+
+**Tarea 6.1.3**: **Garbage collection** controlado
+
+### Módulo 6.2: Interfaz de Usuario Mejorada
+**Tarea 6.2.1**: Panel de estado flotante:
+```
+┌─ WabiSabi Bridge Status ──────┐
+│ Revit: ● Connected (5ms)      │
+│ Mode: Named Pipe              │
+│ FPS: 24 | Cache: 85% hit      │
+│ Queue: 0 pending              │
+└───────────────────────────────┘
+```
+
+**Tarea 6.2.2**: **Tooltips dinámicos** con preview de datos
+
+**Tarea 6.2.3**: **Graficos de rendimiento** en tiempo real
+
+### Módulo 6.3: Sistema de Diagnóstico
+**Tarea 6.3.1**: Nodo de debug con visualización de flujo de datos
+
+**Tarea 6.3.2**: **Profiler integrado** para identificar cuellos de botella
+
+**Tarea 6.3.3**: Exportación de métricas para análisis
+
+---
+
+## Fase 7: Testing, Documentación y Distribución
+
+### Módulo 7.1: Suite de Testing Completa
+**Tarea 7.1.1**: Unit tests para cada nodo con mocks
+
+**Tarea 7.1.2**: Integration tests con servidor mock de Revit
+
+**Tarea 7.1.3**: **Benchmarks de rendimiento** automatizados
+
+**Tarea 7.1.4**: Tests de estabilidad (24h continuous run)
+
+### Módulo 7.2: Documentación Interactiva
+**Tarea 7.2.1**: Documentación con ejemplos ejecutables
+
+**Tarea 7.2.2**: **Workflows de ejemplo** para casos comunes:
+- Renderizado arquitectónico fotorrealista
+- Exploración de diseño con variaciones
+- Animaciones de recorrido
+- Estudios de iluminación
+
+**Tarea 7.2.3**: API reference completa con tipos
+
+### Módulo 7.3: Sistema de Distribución
+**Tarea 7.3.1**: Integración con **ComfyUI Manager**
+
+**Tarea 7.3.2**: **Auto-updater** con versionado semántico
+
+**Tarea 7.3.3**: Sistema de **feature flags** para características experimentales
+
+---
+
+## Consideraciones de Rendimiento
+
+1. **Latencia objetivo**: < 16ms para 60 FPS
+2. **Uso de memoria**: < 1GB adicional con caché completo
+3. **Eficiencia de caché**: > 80% hit rate en uso típico
+4. **Escalabilidad**: Manejar imágenes hasta 8K sin degradación
+
+## Características Experimentales (Futuras)
+
+- **v2.0**: Soporte para múltiples instancias de Revit simultáneas
+- **v2.1**: Integración con ComfyUI3D para meshes y point clouds
+- **v2.2**: Sistema de plugins para extender funcionalidad
+- **v3.0**: Modo colaborativo multi-usuario con sincronización
+
+## Requisitos Mínimos del Sistema
+
+- Python 3.10+
+- ComfyUI versión reciente
+- 8GB RAM (16GB recomendado)
+- GPU con 4GB VRAM mínimo
+- Windows 10/11 (Linux/Mac para modo archivo únicamente)

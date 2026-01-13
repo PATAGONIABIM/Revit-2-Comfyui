@@ -17,6 +17,17 @@ std::atomic<bool> g_shouldExit(false);
 std::unique_ptr<WabiSabiRenderer> g_renderer;
 std::unique_ptr<JournalParser> g_journalParser;
 
+// Función auxiliar para obtener el tiempo de modificación del archivo
+// Se usa std::filesystem::file_time_type para compatibilidad
+std::filesystem::file_time_type getLastWriteTime(const std::string& path) {
+    try {
+        return std::filesystem::last_write_time(path);
+    } catch (...) {
+        // En caso de error (ej. archivo bloqueado momentáneamente), devolvemos el tiempo mínimo
+        return std::filesystem::file_time_type::min();
+    }
+}
+
 // Manejador de señales para cierre limpio
 void signalHandler(int signal) {
     std::cout << "\n[INFO] Señal recibida (" << signal << "), cerrando aplicación..." << std::endl;
@@ -46,16 +57,22 @@ WabiSabiRenderer::RenderConfig loadConfig(const std::string& configPath) {
         config.width = render.get("width", 1280).asInt();
         config.height = render.get("height", 720).asInt();
         config.outputPath = render.get("outputPath", ".").asString();
-        config.cameraFov = render.get("cameraFov", 75.0f).asFloat(); 
+        config.enableDiskIO = render.get("enableDiskIO", false).asBool(); // <--- Leer opción de configuración
+
+        
+        // CORRECCIÓN 1: Ajustar el FOV por defecto. 
+        config.cameraFov = render.get("cameraFov", 50.0f).asFloat(); 
         
         // Configuración de mapas
         const Json::Value& maps = render["maps"];
         
         const Json::Value& depth = maps["depth"];
+        config.gamma = depth.get("gamma", 0.35f).asFloat(); // Leer gamma
         config.enableDepth = depth.get("enabled", true).asBool();
         config.depthFilename = depth.get("filename", "current_depth.png").asString();
         config.minDepth = depth.get("minDepth", 0.1f).asFloat();
         config.maxDepth = depth.get("maxDepth", 100.0f).asFloat();
+        
         
         const Json::Value& normal = maps["normal"];
         config.enableNormals = normal.get("enabled", true).asBool();
@@ -66,7 +83,6 @@ WabiSabiRenderer::RenderConfig loadConfig(const std::string& configPath) {
         config.linesFilename = lines.get("filename", "current_lines.png").asString();
         config.depthThreshold = lines.get("depthThreshold", 0.03f).asFloat();
         config.normalThreshold = lines.get("normalThreshold", 0.4f).asFloat();
-        //config.lineThreshold = lines.get("threshold", 0.1f).asFloat();
         
         const Json::Value& segmentation = maps["segmentation"];
         config.enableSegmentation = segmentation.get("enabled", true).asBool();
@@ -149,48 +165,48 @@ void onCameraUpdate(const JournalCameraData& cameraData, const WabiSabiRenderer:
     static int updateCount = 0;
     updateCount++;
     
-    // El target ahora es un dato primario, no calculado. Lo imprimimos directamente.
     std::cout << "[CAMERA UPDATE " << updateCount << "] " 
               << "Eye: (" << cameraData.eyePosition.x << ", " 
               << cameraData.eyePosition.y << ", " 
               << cameraData.eyePosition.z << ") "
-              << "Target: (" << cameraData.targetPosition.x << ", " // <-- Imprimimos el target real
+              << "Target: (" << cameraData.targetPosition.x << ", "
               << cameraData.targetPosition.y << ", "
               << cameraData.targetPosition.z << ")" << std::endl;
     
     if (g_renderer) {
-        // --- NUEVA LÓGICA DE CÁMARA (CORREGIDA) ---
+        // --- LÓGICA DE CÁMARA (ENCUADRE) ---
         WabiSabiRenderer::CameraData camera;
 
         float fov_vertical_grados = config.cameraFov;
 
-        // 2. Definir vectores de la base de la cámara
+        // 1. Definir posición del ojo
         camera.eyePosition = cameraData.eyePosition;
 
-        // ¡ESTA ES LA CORRECCIÓN CLAVE!
-        // Calcular el vector de dirección real y normalizarlo.
+        // 2. Calcular vectores de base (Normalizados)
         float3 viewDir = CudaMath::normalize(cameraData.targetPosition - cameraData.eyePosition); 
-        
         float3 worldUp = cameraData.upDirection;
         float3 rightDir = CudaMath::normalize(CudaMath::cross(viewDir, worldUp));
         float3 upDir = CudaMath::normalize(CudaMath::cross(rightDir, viewDir));
 
-        // 3. Calcular dimensiones del plano de visión (sin cambios)
+        // 3. Calcular dimensiones del plano de visión (View Plane)
         float aspectRatio = static_cast<float>(config.width) / static_cast<float>(config.height);
         float fov_vertical_rad = fov_vertical_grados * (3.1415926535f / 180.0f);
+        
         float viewPlaneHeight = 2.0f * tan(fov_vertical_rad / 2.0f);
         float viewPlaneWidth = aspectRatio * viewPlaneHeight;
 
+        // 4. Construir los vectores que definen el "frustum" para el Ray Tracing
         camera.horizontal_vec = viewPlaneWidth * rightDir;
         camera.vertical_vec = viewPlaneHeight * upDir;
         
-        // El cálculo de la esquina inferior izquierda sigue siendo válido con el viewDir correcto.
+        // 5. Calcular la esquina inferior izquierda del plano de visión
         camera.lower_left_corner = camera.eyePosition
                                  + viewDir 
                                  - (0.5f * camera.horizontal_vec)
                                  - (0.5f * camera.vertical_vec);
 
         camera.timestamp = cameraData.timestamp;
+        camera.sequenceNumber = updateCount; // <--- CRITICAL FIX: Assign sequence number so ComfyUI detects change
         
         g_renderer->UpdateCamera(camera);
     }
@@ -228,7 +244,7 @@ int main(int argc, char* argv[]) {
         
         std::cout << "[CONFIG] Usando archivo de configuración: " << configPath << std::endl;
         
-        // Cargar configuración
+        // Cargar configuración inicial
         auto config = loadConfig(configPath);
         
         // Crear renderer
@@ -239,8 +255,8 @@ int main(int argc, char* argv[]) {
         std::cout << "[JOURNAL] Inicializando monitor de journal..." << std::endl;
         g_journalParser = std::make_unique<JournalParser>();
         
-        // Detectar versión de Revit (puedes hacer esto más sofisticado)
-        std::string revitVersion = "2026"; // Por defecto
+        // Detectar versión de Revit
+        std::string revitVersion = "2026"; 
         if (argc > 2) {
             revitVersion = argv[2];
         }
@@ -251,21 +267,24 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
-        // --- INICIO DE LA CORRECCIÓN ---
         // Crear un lambda que "capture" la variable 'config'.
-        // Este lambda SÍ tiene la firma que el JournalParser espera: void(const JournalCameraData&).
+        // NOTA: Como 'config' puede cambiar por el Hot Swap, capturamos una referencia
+        // pero en este contexto, 'config' es una variable local de main. 
+        // Para soportar que el callback use la configuración actualizada, deberíamos
+        // consultar la config actual del renderer o pasarla de forma segura.
+        // Por simplicidad en este ejemplo, seguiremos usando la config capturada localmente,
+        // pero ten en cuenta que el cambio de resolución "en caliente" en el callback 
+        // requeriría lógica adicional si la lambda captura por valor.
+        // Capturamos 'config' por referencia para que si la actualizamos abajo, el callback lo vea.
         auto cameraCallback = [&](const JournalCameraData& cameraData) {
-            // Dentro del lambda, llamamos a nuestra función original con el 'config' capturado.
             onCameraUpdate(cameraData, config);
         };
 
-        // Procesa la última cámara del journal al iniciar para tener un estado inicial.
-        // Ahora pasamos el lambda en lugar de la función directamente.
+        // Procesa la última cámara del journal al iniciar
         g_journalParser->ProcessInitialCamera(cameraCallback);
         
         // Iniciar monitoreo del journal
         g_journalParser->StartWatching(cameraCallback);
-        // --- FIN DE LA CORRECCIÓN ---
 
         // Iniciar renderer
         std::cout << "[RENDERER] Iniciando renderizado..." << std::endl;
@@ -278,21 +297,60 @@ int main(int argc, char* argv[]) {
         if (config.enableWebViewer) {
             std::cout << "[INFO] Visualizador web en: http://localhost:" << config.webSocketPort << std::endl;
         }
+        std::cout << "[INFO] Monitoreando cambios en: " << configPath << std::endl;
         std::cout << "[INFO] Presiona Ctrl+C para salir" << std::endl;
         std::cout << "═════════════════════════════════════════════════════\n" << std::endl;
         
-        // Loop principal
+        // --- LOOP PRINCIPAL CON HOT SWAP ---
+        
+        // Inicializar tiempo de última escritura del config
+        auto lastConfigTime = getLastWriteTime(configPath);
         auto lastStatusTime = std::chrono::steady_clock::now();
+        
         while (!g_shouldExit) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            // Dormir un poco para no saturar CPU (200ms para dar tiempo al IO)
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
             
-            // Imprimir estadísticas cada 5 segundos
+            // 1. CHEQUEO DE HOT SWAP DEL CONFIG
+            try {
+                auto currentConfigTime = getLastWriteTime(configPath);
+                
+                // Si el archivo es más nuevo que la última vez que lo leímos
+                if (currentConfigTime > lastConfigTime) {
+                    std::cout << "\n[HOT SWAP] Cambio detectado en " << configPath << ". Recargando..." << std::endl;
+                    
+                    // Esperar un momento breve para asegurar que la escritura del archivo terminó
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    
+                    // Recargar el JSON
+                    auto newConfig = loadConfig(configPath);
+                    
+                    // Actualizar variable local 'config' (afecta al lambda cameraCallback si fue capturada por referencia)
+                    config = newConfig;
+                    
+                    // Aplicar al renderer
+                    if (g_renderer) {
+                        g_renderer->UpdateConfig(newConfig);
+                    }
+                    
+                    lastConfigTime = currentConfigTime;
+                    std::cout << "[HOT SWAP] Configuración actualizada correctamente." << std::endl;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[HOT SWAP ERROR] " << e.what() << std::endl;
+                // Actualizamos el tiempo para no spammear el error si el archivo está corrupto temporalmente
+                lastConfigTime = getLastWriteTime(configPath);
+            }
+            
+            // 2. Imprimir estadísticas cada 5 segundos
             auto now = std::chrono::steady_clock::now();
             if (std::chrono::duration_cast<std::chrono::seconds>(now - lastStatusTime).count() >= 5) {
-                auto stats = g_renderer->GetStatistics();
-                std::cout << "[STATS] FPS: " << stats.fps 
-                         << " | Frame time: " << stats.avgFrameTime << "ms"
-                         << " | Frames: " << stats.totalFrames << std::endl;
+                if (g_renderer) {
+                    auto stats = g_renderer->GetStatistics();
+                    std::cout << "[STATS] FPS: " << stats.fps 
+                             << " | Frame time: " << stats.avgFrameTime << "ms"
+                             << " | Frames: " << stats.totalFrames << std::endl;
+                }
                 lastStatusTime = now;
             }
         }

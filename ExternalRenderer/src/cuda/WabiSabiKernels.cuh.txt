@@ -45,6 +45,8 @@ void LaunchNormalKernel(
 // DECLARACIÓN PARA LÍNEAS (BASADA SOLO EN NORMALES)
 void LaunchLinesKernel(
     const float3* d_normalMap,
+    const float* d_depthMap,
+    const int* d_elementIdMap,
     const RenderConfig& config,
     float* d_linesMap,
     cudaStream_t stream
@@ -55,4 +57,10 @@ void LaunchSegmentationKernel(
     const float3* d_vertices, int vertexCount, const int* d_triangles, const int* d_categoryIds, // <-- AÑADIR d_categoryIds
     const float3* categoryColors, int triangleCount, int categoryCount, // <-- AÑADIR categoryCount
     const CameraData& camera, const RenderConfig& config, float4* d_segmentationMap, cudaStream_t stream
+);
+
+void LaunchIdKernel(
+    const float3* d_vertices, int vertexCount, const int* d_triangles, const int* d_elementIds, 
+    int triangleCount, const CameraData& camera, const RenderConfig& config, 
+    int* d_idMap, cudaStream_t stream
 );

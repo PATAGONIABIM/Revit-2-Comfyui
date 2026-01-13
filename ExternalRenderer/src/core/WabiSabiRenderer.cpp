@@ -9,10 +9,13 @@
 #include <filesystem>
 #include <cstdint>
 #include <cstdlib>
+#include <cmath> 
+#include <shared_mutex> // <-- NECESARIO PARA std::shared_mutex
 #include "../cuda/WabiSabiKernels.cuh"
 #include "../cuda/CudaHelpers.h"
 #include "utils/CSVReader.h"
 #include "utils/Base64.h"
+#include <future> // Necesario para std::async
 
 // Para guardar PNG
 #define STB_IMAGE_WRITE_IMPLEMENTATION
@@ -41,14 +44,28 @@ WabiSabiRenderer::WabiSabiRenderer(const RenderConfig& config)
     CUDA_CHECK(cudaSetDevice(config.cudaDevice));
     printCudaDeviceInfo(config.cudaDevice);
     
-    // Alocar buffers de salida en GPU (esto solo se hace una vez)
+    // 1. Calcular cantidad de píxeles según resolución
     size_t pixelCount = config.width * config.height;
+
+    // 2. Alocar buffers de salida en GPU
     CUDA_CHECK(cudaMalloc(&d_depthMap, pixelCount * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_normalMap, pixelCount * 3 * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_linesMap, pixelCount * sizeof(float)));
     CUDA_CHECK(cudaMalloc(&d_segmentationMap, pixelCount * 4 * sizeof(float)));
 
-    // La carga inicial de geometría Y colores ahora se hace a través de ReloadGeometry
+    // --- INSERTAR ESTA LÍNEA AQUÍ ---
+    CUDA_CHECK(cudaMalloc(&d_elementIdPixelMap, pixelCount * sizeof(int)));
+    // --------------------------------
+
+    // Inicializar MMF Writer
+    if (config.enableMMF) {
+        mmfWriter = std::make_unique<ImageMMFWriter>();
+        if (!mmfWriter->Initialize(config.width, config.height)) {
+            std::cerr << "[RENDERER] Warning: Failed to initialize Shared Memory Writer." << std::endl;
+        }
+    }
+
+    // La carga inicial de geometría y colores
     ReloadGeometry();
     
     std::cout << "[RENDERER] Inicialización completa" << std::endl;
@@ -176,25 +193,26 @@ void WabiSabiRenderer::ReadGeometryHeader() {
     categoryIndexToNameMap.clear();
     std::cout << "[MMF] Leyendo mapa de categorías..." << std::endl;
     for (int i = 0; i < mapEntryCount; ++i) {
-    // Leer el índice compacto
-    int compactIndex = *reinterpret_cast<int*>(mapPtr);
-    mapPtr += sizeof(int);
+        // Leer el índice compacto
+        int compactIndex = *reinterpret_cast<int*>(mapPtr);
+        mapPtr += sizeof(int);
 
-    // --- INICIO DE LA MODIFICACIÓN ---
-    // Eliminar el bucle do-while complejo.
-    
-    // 1. Leer la longitud de la cadena como un int estándar.
-    int stringLength = *reinterpret_cast<int*>(mapPtr);
-    mapPtr += sizeof(int);
+        // --- INICIO DE LA MODIFICACIÓN ---
+        // Eliminar el bucle do-while complejo.
+        
+        // 1. Leer la longitud de la cadena como un int estándar.
+        int stringLength = *reinterpret_cast<int*>(mapPtr);
+        mapPtr += sizeof(int);
 
-    // 2. Leer exactamente esa cantidad de bytes para formar la cadena.
-    std::string categoryName(mapPtr, stringLength);
-    mapPtr += stringLength;
-    // --- FIN DE LA MODIFICACIÓN ---
-    
-    categoryIndexToNameMap[compactIndex] = categoryName;
-    std::cout << "  - Mapeo leído: " << compactIndex << " -> " << categoryName << std::endl;
-}
+        // 2. Leer exactamente esa cantidad de bytes para formar la cadena.
+        std::string categoryName(mapPtr, stringLength);
+        mapPtr += stringLength;
+        // --- FIN DE LA MODIFICACIÓN ---
+        
+        categoryIndexToNameMap[compactIndex] = categoryName;
+        std::cout << "  - Mapeo leído: " << compactIndex << " -> " << categoryName << std::endl;
+    }
+
     float* h_vertices = reinterpret_cast<float*>(basePtr + header->verticesOffset);
     int* h_triangles = reinterpret_cast<int*>(basePtr + header->indicesOffset);
     float* h_normals = reinterpret_cast<float*>(basePtr + header->normalsOffset);
@@ -301,174 +319,52 @@ void WabiSabiRenderer::LoadColorMappingCSV() {
     std::cout << "[CSV] Tabla de colores para GPU creada y transferida." << std::endl;
 }
 
-void WabiSabiRenderer::RenderAllMaps(const CameraData& camera) {
-    if (!d_vertices || vertexCount == 0 || triangleCount == 0) {
-        // No imprimir error constantemente, solo esperar.
-        // std::cerr << "[RENDERER] No hay geometría para renderizar" << std::endl;
-        return;
-    }
-    
-    // Configuración para kernels
-    dim3 blockSize(config.blockSizeX, config.blockSizeY);
-    dim3 gridSize = calculateGridSize(config.width, config.height, blockSize);
-    
-    // Configuración de render para kernels - convertir de WabiSabiRenderer::RenderConfig a ::RenderConfig
-    ::RenderConfig kernelConfig;
-    kernelConfig.width = config.width;
-    kernelConfig.height = config.height;
-    kernelConfig.minDepth = config.minDepth;
-    kernelConfig.maxDepth = config.maxDepth;
-    
-    kernelConfig.depthThreshold = config.depthThreshold;
-    kernelConfig.normalThreshold = config.normalThreshold;
-    
-    // Convertir WabiSabiRenderer::CameraData a ::CameraData
-    ::CameraData kernelCamera;
-    kernelCamera.eyePosition = camera.eyePosition;
-    kernelCamera.lower_left_corner = camera.lower_left_corner;
-    kernelCamera.horizontal_vec = camera.horizontal_vec;
-    kernelCamera.vertical_vec = camera.vertical_vec;
-    
-    // Crear streams CUDA para paralelización
-    cudaStream_t depthStream, normalStream, linesStream, segmentStream;
-    CUDA_CHECK(cudaStreamCreate(&depthStream));
-    CUDA_CHECK(cudaStreamCreate(&normalStream));
-    CUDA_CHECK(cudaStreamCreate(&linesStream));
-    CUDA_CHECK(cudaStreamCreate(&segmentStream));
-    
-    // Lanzar kernels en paralelo
-    if (config.enableDepth) {
-        LaunchDepthKernel(
-            reinterpret_cast<float3*>(d_vertices),
-            vertexCount,
-            d_triangles,
-            triangleCount,
-            kernelCamera, 
-            kernelConfig,
-            d_depthMap,
-            depthStream
-        );
-    }
-    
-    if (config.enableNormals) {
-        LaunchNormalKernel(
-            reinterpret_cast<float3*>(d_vertices),
-            vertexCount,
-            d_triangles,
-            reinterpret_cast<float3*>(d_normals),
-            triangleCount,
-            kernelCamera, 
-            kernelConfig,
-            reinterpret_cast<float3*>(d_normalMap),
-            normalStream
-        );
-    }
-    
-    if (config.enableLines) {
-    // La llamada ahora es simple y solo depende del mapa de normales.
-    LaunchLinesKernel(
-        reinterpret_cast<float3*>(d_normalMap), // <-- SOLO PASAR EL MAPA DE NORMALES
-        kernelConfig,
-        d_linesMap,
-        linesStream
+// Actualizado: acepta config como parámetro
+void WabiSabiRenderer::RenderAllMaps(const WabiSabiRenderer::CameraData& camera, const WabiSabiRenderer::RenderConfig& localConfig, cudaStream_t stream) {
+    if (!d_vertices || vertexCount == 0 || triangleCount == 0) return;
+
+    // Configuración para el kernel (usando tipos globales de WabiSabiKernels.cuh)
+    ::RenderConfig kConf = { 
+        localConfig.width, localConfig.height, 
+        localConfig.minDepth, localConfig.maxDepth, 
+        localConfig.depthThreshold, localConfig.normalThreshold 
+    };
+
+    ::CameraData kCam = { 
+        camera.eyePosition, camera.lower_left_corner, 
+        camera.horizontal_vec, camera.vertical_vec 
+    };
+
+    // LLAMADA AL NUEVO MEGA-KERNEL (Reemplaza a las 4 llamadas anteriores)
+    LaunchAllMapsKernel(
+        reinterpret_cast<float3*>(d_vertices), vertexCount, d_triangles, 
+        reinterpret_cast<float3*>(d_normals), d_elementIds, d_categoryIds, 
+        d_categoryColors, triangleCount, categoryCount,
+        kCam, kConf, 
+        d_depthMap, 
+        reinterpret_cast<float3*>(d_normalMap), 
+        d_elementIdPixelMap, 
+        reinterpret_cast<float4*>(d_segmentationMap), 
+        stream
     );
-}
-    
-    if (config.enableSegmentation) {
-        LaunchSegmentationKernel(
-            reinterpret_cast<float3*>(d_vertices),
-            vertexCount,
-            d_triangles,
-            d_categoryIds, // <-- Pasar el nuevo buffer de IDs de categoría
-            d_categoryColors,
-            triangleCount,
-            categoryCount, // <-- Pasar el número de categorías
-            kernelCamera, 
-            kernelConfig,
-            reinterpret_cast<float4*>(d_segmentationMap),
-            segmentStream
+
+    // Sincronizar para poder procesar las líneas después (dentro del stream)
+    // No necesitamos sincronizar CPU-GPU aquí, solo la coherencia del stream
+    // Pero LaunchLinesKernel depende de los resultados anteriores en d_normalMap y d_elementIdPixelMap
+
+    if (localConfig.enableLines) {
+        LaunchLinesKernel(
+            reinterpret_cast<float3*>(d_normalMap), 
+            d_depthMap, 
+            d_elementIdPixelMap, 
+            kConf, 
+            d_linesMap, 
+            stream
         );
     }
-    
-    // Sincronizar todos los streams
-    CUDA_CHECK(cudaStreamSynchronize(depthStream));
-    CUDA_CHECK(cudaStreamSynchronize(normalStream));
-    CUDA_CHECK(cudaStreamSynchronize(linesStream));
-    CUDA_CHECK(cudaStreamSynchronize(segmentStream));
-    
-    // Limpiar streams
-    CUDA_CHECK(cudaStreamDestroy(depthStream));
-    CUDA_CHECK(cudaStreamDestroy(normalStream));
-    CUDA_CHECK(cudaStreamDestroy(linesStream));
-    CUDA_CHECK(cudaStreamDestroy(segmentStream));
-    
-    totalFrames++;
 }
 
-void WabiSabiRenderer::SaveMapsToFiles() {
-    std::filesystem::create_directories(config.outputPath);
-    
-    size_t pixelCount = config.width * config.height;
-    
-    // Búferes temporales en el host (CPU)
-    std::vector<float> h_buffer(pixelCount * 4);
-    std::vector<unsigned char> imageBuffer(pixelCount * 4);
 
-    // --- ¡LA LÍNEA MÁGICA! ---
-    // Le decimos a la librería stb que debe voltear verticalmente todas las imágenes que guarde.
-    stbi_flip_vertically_on_write(1); // 1 = true
-
-    // --- GUARDAR MAPA DE PROFUNDIDAD (lógica simplificada) ---
-    if (config.enableDepth) {
-        CUDA_CHECK(cudaMemcpy(h_buffer.data(), d_depthMap, 
-                              pixelCount * sizeof(float), cudaMemcpyDeviceToHost));
-        
-        for (size_t i = 0; i < pixelCount; i++) {
-            float distance = h_buffer[i];
-            unsigned char pixel_value = 255; // Fondo blanco por defecto
-            if (distance < config.maxDepth) {
-                float normalized = 1.0f - fmaxf(0.0f, fminf(1.0f, (distance - config.minDepth) / (config.maxDepth - config.minDepth)));
-                pixel_value = static_cast<unsigned char>(normalized * 255.0f);
-            }
-            imageBuffer[i] = pixel_value;
-        }
-        std::string path = config.outputPath + "/" + config.depthFilename;
-        stbi_write_png(path.c_str(), config.width, config.height, 1, imageBuffer.data(), config.width);
-    }
-    
-    // --- GUARDAR MAPA DE NORMALES (lógica simplificada) ---
-    if (config.enableNormals) {
-        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(h_buffer.data()), d_normalMap,
-                              pixelCount * sizeof(float3), cudaMemcpyDeviceToHost));
-        
-        convertFloat3ToRGB(reinterpret_cast<const float3*>(h_buffer.data()), imageBuffer.data(), pixelCount);
-        
-        std::string path = config.outputPath + "/" + config.normalFilename;
-        stbi_write_png(path.c_str(), config.width, config.height, 3, imageBuffer.data(), config.width * 3);
-    }
-    
-    // --- GUARDAR MAPA DE LÍNEAS (lógica simplificada) ---
-    if (config.enableLines) {
-        CUDA_CHECK(cudaMemcpy(h_buffer.data(), d_linesMap, 
-                              pixelCount * sizeof(float), cudaMemcpyDeviceToHost));
-
-        convertFloatToUchar(h_buffer.data(), imageBuffer.data(), pixelCount, false);
-
-        std::string path = config.outputPath + "/" + config.linesFilename;
-        stbi_write_png(path.c_str(), config.width, config.height, 1, imageBuffer.data(), config.width);
-    }
-    
-    // --- GUARDAR MAPA DE SEGMENTACIÓN (lógica simplificada) ---
-    if (config.enableSegmentation) {
-        CUDA_CHECK(cudaMemcpy(reinterpret_cast<void*>(h_buffer.data()), d_segmentationMap,
-                              pixelCount * sizeof(float4), cudaMemcpyDeviceToHost));
-
-        convertFloat4ToRGBA(reinterpret_cast<const float4*>(h_buffer.data()), imageBuffer.data(), pixelCount);
-        
-        std::string path = config.outputPath + "/" + config.segmentationFilename;
-        stbi_write_png(path.c_str(), config.width, config.height, 4, imageBuffer.data(), config.width * 4);
-    }
-}
 std::string WabiSabiRenderer::FindLatestWabiSabiMMF() {
     std::cout << "[MMF] Buscando Memory Mapped File de WabiSabi..." << std::endl;
     
@@ -526,7 +422,6 @@ std::string WabiSabiRenderer::FindLatestWabiSabiMMF() {
     throw std::runtime_error("No se encontró ningún Memory Mapped File de WabiSabi");
 }
 
-// Implementación del resto de métodos...
 void WabiSabiRenderer::Start() {
     isRunning = true;
     renderThread = std::thread(&WabiSabiRenderer::RenderLoop, this);
@@ -537,63 +432,232 @@ void WabiSabiRenderer::Start() {
     }
 }
 
+// Actualizado: RenderLoop con copia local de configuración y bloqueo seguro
+
+
 void WabiSabiRenderer::RenderLoop() {
-    std::cout << "[RENDERER] Bucle de renderizado en espera de la primera cámara..." << std::endl;
+    std::cout << "[RENDERER] Bucle iniciado con optimización de Kernel Combinado y Grabado Asíncrono." << std::endl;
+    
     {
         std::unique_lock<std::mutex> lock(cameraMutex);
-        // El hilo esperará aquí hasta que cameraInitialized sea true.
         cameraCv.wait(lock, [this]{ return cameraInitialized; });
     }
-    std::cout << "[RENDERER] Cámara inicializada. Iniciando renderizado de fotogramas." << std::endl;
+
     auto lastFrameTime = std::chrono::steady_clock::now();
-    
+
     while (isRunning) {
-        CheckForUpdates(); // <-- ¡LÓGICA DE ACTUALIZACIÓN AÑADIDA AQUÍ!
+        CheckForUpdates(); 
         auto frameStart = std::chrono::steady_clock::now();
         
-        // Obtener última posición de cámara
         CameraData camera = GetLatestCamera();
-        
-        // Renderizar los 4 mapas
-        RenderAllMaps(camera);
-        
-        // Guardar a archivos PNG
-        SaveMapsToFiles();
-        
-        // Enviar a WebSocket si está conectado
-        if (config.enableWebViewer && wsConnected) {
-            auto ws_start = std::chrono::steady_clock::now();
-            SendMapsToWebSocket();
-            auto ws_end = std::chrono::steady_clock::now();
-            // Opcional: imprimir tiempo de envío
-            // std::cout << "[WebSocket] Envío de mapas tomó: " << std::chrono::duration_cast<std::chrono::milliseconds>(ws_end - ws_start).count() << "ms" << std::endl;
+        RenderConfig localConfig;
+        {
+            std::shared_lock<std::shared_mutex> lock(configMutex);
+            localConfig = config;
         }
+
+        // --- PASO 1: CONFIGURAR ESTRUCTURAS PARA KERNELS ---
+        ::RenderConfig kernelConfig;
+        kernelConfig.width = localConfig.width;
+        kernelConfig.height = localConfig.height;
+        kernelConfig.minDepth = localConfig.minDepth;
+        kernelConfig.maxDepth = localConfig.maxDepth;
+        kernelConfig.depthThreshold = localConfig.depthThreshold;
+        kernelConfig.normalThreshold = localConfig.normalThreshold;
+
+        ::CameraData kernelCamera;
+        kernelCamera.eyePosition = camera.eyePosition;
+        kernelCamera.lower_left_corner = camera.lower_left_corner;
+        kernelCamera.horizontal_vec = camera.horizontal_vec;
+        kernelCamera.vertical_vec = camera.vertical_vec;
+
+        // --- PASO 2: RENDERIZADO (RTX 3090 POWER) ---
+        cudaStream_t renderStream;
+        cudaStreamCreate(&renderStream);
+
+        // LANZAMIENTO DEL KERNEL COMBINADO (Todo en un solo bucle de triángulos)
+        RenderAllMaps(camera, localConfig, renderStream); // <-- Usar la funcion miembro refactorizada
+
+        // (Lines Kernel is called inside RenderAllMaps now)
+        cudaStreamSynchronize(renderStream); // Wait for completion before copying
+
+        // --- PASO 3: COPIADO RÁPIDO DE GPU A RAM ---
+        // Esto es muy rápido, libera a la GPU casi al instante
+        HostFrameData frameData = CopyGpuToHost(localConfig, camera.sequenceNumber);
+
+        // --- PASO 4: GRABADO ASÍNCRONO (DISCO / MMF) ---
         
+        // 4A: DISCO (Opcional, lento)
+        if (localConfig.enableDiskIO) {
+            std::thread([this, frameData, localConfig]() {
+                this->SaveToDiskInternal(frameData, localConfig);
+            }).detach();
+        }
+
+        // 4B: MMF (Rapidísimo)
+        if (localConfig.enableMMF) {
+            WriteToMMFInternal(frameData);
+        }
+
+        // Opcional: Enviar a WebSocket (también asíncrono si quieres más velocidad)
+        if (localConfig.enableWebViewer && wsConnected) {
+            SendMapsToWebSocket(localConfig);
+        }
+
+        cudaStreamDestroy(renderStream);
+
+        // --- ESTADÍSTICAS ---
         auto frameEnd = std::chrono::steady_clock::now();
-        auto frameDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            frameEnd - frameStart);
-        
-        // Actualizar estadísticas
-        avgFrameTime = frameDuration.count();
-        
-        // Calcular FPS
-        auto timeSinceLastFrame = std::chrono::duration_cast<std::chrono::milliseconds>(
-            frameEnd - lastFrameTime);
-        if (timeSinceLastFrame.count() > 0) {
-            currentFPS = 1000.0f / timeSinceLastFrame.count();
-        }
+        avgFrameTime = std::chrono::duration_cast<std::chrono::milliseconds>(frameEnd - frameStart).count();
+        currentFPS = 1000.0f / std::chrono::duration_cast<std::chrono::milliseconds>(frameEnd - lastFrameTime).count();
         lastFrameTime = frameEnd;
-        
-        // Limitar FPS
-        int targetFrameTime = 1000 / config.maxFPS;
-        if (frameDuration.count() < targetFrameTime) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(targetFrameTime - frameDuration.count()));
+        totalFrames++;
+
+        int targetMs = 1000 / localConfig.maxFPS;
+        if (avgFrameTime < targetMs) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(targetMs - (int)avgFrameTime));
         }
     }
 }
 
-// Implementar el resto de métodos existentes...
+// Función para mover datos de la GPU a la RAM del sistema lo más rápido posible
+WabiSabiRenderer::HostFrameData WabiSabiRenderer::CopyGpuToHost(const WabiSabiRenderer::RenderConfig& localConfig, int64_t seqNum) {
+    size_t pixelCount = localConfig.width * localConfig.height;
+    HostFrameData data;
+    data.sequenceNumber = seqNum; // <-- Asignar secuencia
+    data.width = localConfig.width;
+    data.height = localConfig.height;
+
+    data.depth.resize(pixelCount);
+    data.normals.resize(pixelCount);
+    data.lines.resize(pixelCount);
+    data.segmentation.resize(pixelCount);
+
+    cudaMemcpy(data.depth.data(), d_depthMap, pixelCount * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(data.normals.data(), d_normalMap, pixelCount * sizeof(float3), cudaMemcpyDeviceToHost);
+    cudaMemcpy(data.lines.data(), d_linesMap, pixelCount * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(data.segmentation.data(), d_segmentationMap, pixelCount * sizeof(float4), cudaMemcpyDeviceToHost);
+
+    return data;
+}
+
+void WabiSabiRenderer::WriteToMMFInternal(const HostFrameData& data) {
+    if (mmfWriter) {
+        // Enviar todos los buffers
+        
+        // 1. Flatten Normals (float3 -> float)
+        std::vector<float> flattenedNormals;
+        flattenedNormals.reserve(data.normals.size() * 3);
+        for (const auto& n : data.normals) {
+            flattenedNormals.push_back(n.x);
+            flattenedNormals.push_back(n.y);
+            flattenedNormals.push_back(n.z);
+        }
+
+        // 2. Flatten Segmentation (float4 -> float)
+        std::vector<float> flattenedSegmentation;
+        flattenedSegmentation.reserve(data.segmentation.size() * 4);
+        for (const auto& s : data.segmentation) {
+            flattenedSegmentation.push_back(s.x);
+            flattenedSegmentation.push_back(s.y);
+            flattenedSegmentation.push_back(s.z);
+            flattenedSegmentation.push_back(s.w);
+        }
+
+        mmfWriter->WriteFrame(data.sequenceNumber, 
+                              data.depth, 
+                              flattenedNormals, 
+                              data.lines, 
+                              flattenedSegmentation);
+    }
+}
+
+// Esta función corre en un hilo separado de la CPU
+void WabiSabiRenderer::SaveToDiskInternal(const HostFrameData& data, const WabiSabiRenderer::RenderConfig& localConfig) {
+    size_t pixelCount = data.width * data.height;
+    std::vector<unsigned char> img(pixelCount * 4);
+    
+    stbi_flip_vertically_on_write(1);
+
+    // Guardar Depth
+    if (localConfig.enableDepth) {
+        for (size_t i = 0; i < pixelCount; i++) {
+            float d = data.depth[i];
+            float linear = fmaxf(0.0f, fminf(1.0f, (d - localConfig.minDepth) / (localConfig.maxDepth - localConfig.minDepth)));
+            img[i] = static_cast<unsigned char>((1.0f - powf(linear, localConfig.gamma)) * 255.0f);
+        }
+        stbi_write_png((localConfig.outputPath + "/" + localConfig.depthFilename).c_str(), data.width, data.height, 1, img.data(), data.width);
+    }
+
+    // Guardar Normals
+    if (localConfig.enableNormals) {
+        std::vector<unsigned char> imgRGB(pixelCount * 3);
+        for (size_t i = 0; i < pixelCount; i++) {
+            imgRGB[i*3+0] = static_cast<unsigned char>((data.normals[i].x * 0.5f + 0.5f) * 255.0f);
+            imgRGB[i*3+1] = static_cast<unsigned char>((data.normals[i].y * 0.5f + 0.5f) * 255.0f);
+            imgRGB[i*3+2] = static_cast<unsigned char>((data.normals[i].z * 0.5f + 0.5f) * 255.0f);
+        }
+        stbi_write_png((localConfig.outputPath + "/" + localConfig.normalFilename).c_str(), data.width, data.height, 3, imgRGB.data(), data.width * 3);
+    }
+
+    // Guardar Lines
+    if (localConfig.enableLines) {
+        for (size_t i = 0; i < pixelCount; i++) img[i] = static_cast<unsigned char>(data.lines[i] * 255.0f);
+        stbi_write_png((localConfig.outputPath + "/" + localConfig.linesFilename).c_str(), data.width, data.height, 1, img.data(), data.width);
+    }
+
+    // Guardar Segmentation
+    if (localConfig.enableSegmentation) {
+        for (size_t i = 0; i < pixelCount; i++) {
+            img[i*4+0] = static_cast<unsigned char>(data.segmentation[i].x * 255.0f);
+            img[i*4+1] = static_cast<unsigned char>(data.segmentation[i].y * 255.0f);
+            img[i*4+2] = static_cast<unsigned char>(data.segmentation[i].z * 255.0f);
+            img[i*4+3] = 255;
+        }
+        stbi_write_png((localConfig.outputPath + "/" + localConfig.segmentationFilename).c_str(), data.width, data.height, 4, img.data(), data.width * 4);
+    }
+}
+
+// Método para actualizar la configuración en tiempo real
+void WabiSabiRenderer::UpdateConfig(const WabiSabiRenderer::RenderConfig& newConfig) {
+    std::unique_lock<std::shared_mutex> lock(configMutex);
+    
+    bool resolutionChanged = (config.width != newConfig.width || config.height != newConfig.height);
+    
+    if (resolutionChanged) {
+        // CRÍTICO: Esperar a que la GPU termine CUALQUIER tarea antes de liberar
+        cudaDeviceSynchronize(); 
+
+        std::cout << "[CONFIG] Resolución cambiada. Recreando buffers GPU..." << std::endl;
+        
+        // Liberar de forma segura
+        if (d_depthMap) cudaFree(d_depthMap);
+        if (d_normalMap) cudaFree(d_normalMap);
+        if (d_linesMap) cudaFree(d_linesMap);
+        if (d_segmentationMap) cudaFree(d_segmentationMap);
+        if (d_elementIdPixelMap) cudaFree(d_elementIdPixelMap);
+
+        // Actualizar valores después de la sincronización
+        config = newConfig; 
+        size_t pixelCount = (size_t)config.width * config.height;
+
+        // Re-asignar
+        CUDA_CHECK(cudaMalloc(&d_depthMap, pixelCount * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_normalMap, pixelCount * 3 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_linesMap, pixelCount * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_segmentationMap, pixelCount * 4 * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_elementIdPixelMap, pixelCount * sizeof(int)));
+
+        // Re-inicializar MMF
+        if (config.enableMMF) {
+             mmfWriter = std::make_unique<ImageMMFWriter>();
+             mmfWriter->Initialize(config.width, config.height);
+        }
+    } else {
+        config = newConfig;
+    }
+}
+
 WabiSabiRenderer::~WabiSabiRenderer() {
     Stop();
     
@@ -697,7 +761,8 @@ void WabiSabiRenderer::StartWebSocketServer() {
     });
 }
 
-void WabiSabiRenderer::SendMapsToWebSocket() {
+// Actualizado: acepta config como parámetro
+void WabiSabiRenderer::SendMapsToWebSocket(const RenderConfig& config) {
     std::lock_guard<std::mutex> lock(ws_mutex);
     if (!wsConnected || ws_connection_hdl.expired()) return;
 
@@ -728,13 +793,23 @@ void WabiSabiRenderer::SendMapsToWebSocket() {
     stbi_flip_vertically_on_write(1); // Importante para que coincida con el frontend
 
     if (config.enableDepth) {
-        // Misma lógica de normalización que en SaveMapsToFiles
         CUDA_CHECK(cudaMemcpy(h_buffer.data(), d_depthMap, pixelCount * sizeof(float), cudaMemcpyDeviceToHost));
+        
+        float depthGamma = config.gamma; // Asegúrate de que coincida con el de arriba
+
         for (size_t i = 0; i < pixelCount; i++) {
             float distance = h_buffer[i];
-            unsigned char val = 255;
-            if (distance < config.maxDepth) {
-                val = static_cast<unsigned char>((1.0f - fmaxf(0.0f, fminf(1.0f, (distance - config.minDepth) / (config.maxDepth - config.minDepth)))) * 255.0f);
+            unsigned char val = 0;
+            
+            if (distance < config.maxDepth * 2.0f) {
+                float linearDepth = (distance - config.minDepth) / (config.maxDepth - config.minDepth);
+                linearDepth = fmaxf(0.0f, fminf(1.0f, linearDepth));
+                
+                // Aplicar Gamma
+                float nonLinearDepth = powf(linearDepth, depthGamma);
+                
+                // Invertir
+                val = static_cast<unsigned char>((1.0f - nonLinearDepth) * 255.0f);
             }
             imageBuffer[i] = val;
         }

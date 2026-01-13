@@ -1,15 +1,17 @@
 {
     "render": {
-        "width": 1280,
-        "height": 720,
+        "width": 1920,
+        "height": 1080,
         "outputPath": "C:\\Users\\chris\\OneDrive\\Imágenes\\wabisabiBRIDGE",
+        "enableDiskIO": false,
         "cameraFov": 45.0,
         "maps": {
             "depth": {
                 "enabled": true,
                 "filename": "current_depth.png",
-                "minDepth": 0.1,
-                "maxDepth": 325.0
+                "minDepth": 1.0,
+                "maxDepth": 200.0,
+                "gamma": 0.45
             },
             "normal": {
                 "enabled": true,
@@ -18,7 +20,8 @@
             "lines": {
                 "enabled": true,
                 "filename": "current_lines.png",
-                "normalThreshold": 0.2
+                "normalThreshold": 0.1,
+                "depthThreshold": 0.08
             },
             "segmentation": {
                 "enabled": true,
@@ -34,7 +37,7 @@
         "blockSizeY": 16
     },
     "webViewer": {
-        "enabled": true,
+        "enabled": false,
         "port": 9001,
         "host": "localhost"
     }

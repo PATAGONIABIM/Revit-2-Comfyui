@@ -1,0 +1,18 @@
+# Dependencias para ComfyUI WabiSabi Bridge
+# La mayoría ya vienen incluidas con ComfyUI
+
+# Procesamiento de imágenes
+Pillow>=9.0.0
+
+# Arrays y tensores (incluidos en ComfyUI)
+numpy
+torch
+
+# Sistema de archivos (incluido en Python)
+# pathlib
+# hashlib
+
+# Opcional para futuras versiones:
+# watchdog>=3.0.0  # Para vigilancia de archivos más eficiente
+# msgpack>=1.0.0   # Para serialización binaria
+# opencv-python>=4.0.0  # Para procesamiento avanzado de imágenes

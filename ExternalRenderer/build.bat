@@ -28,7 +28,7 @@ echo.
 echo ============================================
 echo Configurando con CMake...
 echo ============================================
-cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE="%VCPKG_TOOLCHAIN_FILE%"
+cmake .. -G "Visual Studio 17 2022" -A x64 -DCMAKE_TOOLCHAIN_FILE="%VCPKG_TOOLCHAIN_FILE%" -T cuda="C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8"
 
 if %errorlevel% neq 0 (
     echo.

@@ -1,9 +1,15 @@
-# WabiSabi Bridge - Color-Category Mapping
-# Basado en el esquema de colores del dataset ADE20K.
-# Las categorías sin un mapeo directo se han asignado a colores lógicos o por defecto.
-# Unmapped Default Color: #FF00FF (Magenta)
 Category,Color
-# --- CATEGORÍAS ARQUITECTÓNICAS PRINCIPALES ---
+# --- PILRES Y ESTRUCTURA VERTICAL ---
+OST_StructuralColumns,#FF0829
+OST_Columns,#FF0829
+# A veces los pilares se modelan como Genericos o Masas por error
+# OST_GenericModel (Ya lo tienes mapeado en verde, revisa si tus pilares son verdes)
+
+# --- ESTRUCTURA HORIZONTAL ---
+OST_StructuralFraming,#FF00FF
+OST_StructuralFoundation,#503232
+
+# --- RESTO ARQUITECTURA ---
 OST_Walls,#787878
 OST_Floors,#503232
 OST_Ceilings,#787850
@@ -13,28 +19,43 @@ OST_Doors,#08FF33
 OST_Stairs,#FFE000
 OST_Railings,#FF3D06
 OST_CurtainWallPanels,#E6E6E6
-# --- CATEGORÍAS ESTRUCTURALES ---
-OST_StructuralColumns,#FF0829
-OST_StructuralFraming,#FF00FF
-OST_StructuralFoundation,#503232
-# --- MOBILIARIO Y EQUIPO ---
+
+# --- MOBILIARIO ---
 OST_Furniture,#FF0652
 OST_Casework,#E005FF
 OST_PlumbingFixtures,#00A3FF
-OST_GenericModel,#00FF14
-# --- ELEMENTOS DE ENTORNO Y EXTERIOR ---
+
+# --- ENTORNO ---
 OST_Entourage,#96053D
 OST_Planting,#04C803
 OST_Topography,#787846
-# --- CATEGORÍAS MEP (Mecánica, Electricidad, Fontanería) ---
+OST_Toposolid,#787846
+OST_Site,#787846
+
+# --- MEP ---
 OST_DuctCurves,#DCDCDC
 OST_PipeCurves,#FF7A08
 OST_CableTray,#FFB806
 OST_Conduit,#FFC207
 OST_LightingFixtures,#FFAD00
 OST_MechanicalEquipment,#14FF00
-# --- OTRAS CATEGORÍAS COMUNES ---
+
+# --- EXTRAS ---
 OST_Ramps,#503232
 OST_Parking,#8C8C8C
 OST_Roads,#8C8C8C
-OST_Toposolid, #787846
+
+# Subdivisión de Toposólido -> Color de Topografía
+OST_Subdivision,#787846
+
+# Componentes de Escaleras -> Color de Escalera
+OST_StairsRuns,#FFE000
+
+# Componentes de Barandillas -> Color de Barandilla
+OST_StairsRailing,#FF3D06
+OST_RailingTopRail,#FF3D06
+
+# Muro Cortina -> Color de Paneles/Ventana (para unificar la superficie)
+OST_CurtainGridsWall,#E6E6E6
+# Te recomiendo agregar también los Montantes por si acaso:
+OST_CurtainWallMullions,#E6E6E6
