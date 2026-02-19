@@ -15,6 +15,11 @@ WabiSabi Revit Bridge is an advanced plugin for Autodesk Revit 2026 designed to 
     *   **Automatic (Optimized)**: Smart change detection with configurable throttling.
     *   **Batch**: Sequential processing of multiple views.
 
+![Preview 1](docs/images/preview_1.png)
+![Preview 2](docs/images/preview_2.png)
+![Preview 3](docs/images/preview_3.png)
+![Preview 4](docs/images/preview_4.png)
+
 ## 🏗️ Architecture
 
 The system operates on a **Producer/Consumer** model to bypass Revit's API performance limitations:
@@ -60,6 +65,11 @@ WabiSabi Revit Bridge es un plugin avanzado para Autodesk Revit 2026 diseñado p
     *   **Manual**: Actualizaciones precisas bajo demanda.
     *   **Automático (Optimizado)**: Detección inteligente de cambios con limitación (throttling) configurable.
     *   **Batch**: Procesamiento secuencial de múltiples vistas.
+
+![Vista Previa 1](docs/images/preview_1.png)
+![Vista Previa 2](docs/images/preview_2.png)
+![Vista Previa 3](docs/images/preview_3.png)
+![Vista Previa 4](docs/images/preview_4.png)
 
 ## 🏗️ Arquitectura
 
