@@ -20,6 +20,8 @@ WabiSabi Revit Bridge is an advanced plugin for Autodesk Revit 2026 designed to 
 ![Preview 3](docs/images/preview_3.png)
 ![Preview 4](docs/images/preview_4.png)
 
+*The preview images above show the technical maps extracted by the External Renderer using the model stored in the Memory Mapped File (MMF), perfectly synchronized with Revit.*
+
 ## 🏗️ Architecture
 
 The system operates on a **Producer/Consumer** model to bypass Revit's API performance limitations:
@@ -45,7 +47,13 @@ The core add-in installed in Revit 2026. It handles the UI, manages the extracti
 A lightweight, high-performance rendering engine. It visualizes the data sent by the plugin. By decoupled rendering from the Revit process, we achieve frame rates impossible within the Revit API context.
 
 ### 3. ComfyUI Node
-A custom node for ComfyUI that acts as the receiver. It integrates the real-time stream into your node graph, allowing for "Live Interactive Rendering" where your Revit view drives the AI generation.
+A custom node for ComfyUI acts as the receiver, reading the extracted maps in real-time. By leveraging **ControlNet** and **SDXL Turbo**, you can achieve rapid, high-fidelity iterations, instantaneously transforming your Revit model into photorealistic visualizations.
+
+## ⚙️ Configuration
+
+The External Renderer configuration is managed via **`ExternalRenderer/config/renderer_config.json`** and **`ExternalRenderer/config/category_colors.csv`**.
+
+These files are located in `@[ExternalRenderer/config]` and **must be copied to the `release` folder** inside `@[ExternalRenderer]` for the application to load them correctly.
 
 ---
 
@@ -70,6 +78,8 @@ WabiSabi Revit Bridge es un plugin avanzado para Autodesk Revit 2026 diseñado p
 ![Vista Previa 2](docs/images/preview_2.png)
 ![Vista Previa 3](docs/images/preview_3.png)
 ![Vista Previa 4](docs/images/preview_4.png)
+
+*Las imágenes de vista previa mostradas arriba son los mapas extraídos por el Renderizador Externo utilizando el modelo almacenado en la MMF sincronizado con Revit.*
 
 ## 🏗️ Arquitectura
 
@@ -96,4 +106,10 @@ El complemento principal instalado en Revit 2026. Maneja la interfaz de usuario,
 Un motor de renderizado ligero y de alto rendimiento. Visualiza los datos enviados por el plugin. Al desacoplar el renderizado del proceso de Revit, logramos tasas de cuadros por segundo imposibles dentro del contexto de la API de Revit.
 
 ### 3. Nodo de ComfyUI
-Un nodo personalizado para ComfyUI que actúa como el receptor. Integra el flujo en tiempo real en tu gráfico de nodos, permitiendo un "Renderizado Interactivo en Vivo" donde tu vista de Revit impulsa la generación de IA.
+Un nodo personalizado para ComfyUI actúa como receptor, leyendo los mapas extraídos en tiempo real. Aprovechando **ControlNet** y **SDXL Turbo**, es posible iterar rápidamente, transformando instantáneamente tu modelo de Revit en visualizaciones fotorrealistas con alta fidelidad.
+
+## ⚙️ Configuración
+
+La configuración del Renderizador Externo se gestiona a través de **`ExternalRenderer/config/renderer_config.json`** y **`ExternalRenderer/config/category_colors.csv`**.
+
+Estos archivos se encuentran en `@[ExternalRenderer/config]` y **deben copiarse a la carpeta `release`** dentro de `@[ExternalRenderer]` para que la aplicación los cargue correctamente.
