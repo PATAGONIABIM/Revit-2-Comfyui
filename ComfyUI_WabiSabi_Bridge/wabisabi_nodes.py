@@ -241,21 +241,28 @@ class LoadImageFromMMFNode:
     FUNCTION = "load_mmf"
 
     @classmethod
-    def IS_CHANGED(cls, **kwargs):
+    def IS_CHANGED(cls, channel, auto_reload, trigger=0):
         # Esta función le dice a ComfyUI si el nodo debe re-ejecutarse.
         # Leemos el SequenceNumber del MMF.
         try:
             # Header size 72 bytes
             # int32 width, int32 height, int64 timestamp, int64 sequence
             # sequence está en offset 4+4+8 = 16
+            
+            # Usar modo seguro (Open/Close) para no bloquear
             with mmap.mmap(-1, 72, "WabiSabiBridge_ImageStream", access=mmap.ACCESS_READ) as mm:
                 mm.seek(16)
                 seq_bytes = mm.read(8)
                 sequence = struct.unpack('<q', seq_bytes)[0]
-                # print(f"[MMF DEBUG] IS_CHANGED Poll -> Seq: {sequence}") # Demasiado spam?
+                
+                # Descomentar para debug extremo si no actualiza
+                print(f"[MMF POLL] Seq: {sequence}") 
                 return float(sequence)
-        except Exception:
-            return float("nan")
+        except FileNotFoundError:
+             return float(0.0) # Si no existe, no ha cambiado (estado 0)
+        except Exception as e:
+            # print(f"[MMF POLL ERROR] {e}")
+            return float(-1.0) # Error state
 
     def load_mmf(self, channel, auto_reload, trigger=0):
         image, seq = self.reader.read(channel)

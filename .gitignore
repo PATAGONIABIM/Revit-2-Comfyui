@@ -71,3 +71,36 @@ logs/
 
 # Entorno de Visual Studio Code (si se usa)
 .vscode/
+
+# Revit
+*.rvt
+*.rfa
+*.rte
+*.rft
+*_Backup/
+*.slog
+
+# C++ / Visual Studio Build
+x64/
+Debug/
+Release/
+*.ipch
+*.sdf
+*.opensdf
+*.db
+*.op
+*.tlog
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+env/
+venv/
+*.egg-info/
+
+# Temporary files
+*.log
+tmp/
+temp/
+*.tmp
